@@ -1,6 +1,7 @@
 /*
  * This file is part of the Pico FIDO distribution (https://github.com/polhenarejos/pico-fido).
  * Copyright (c) 2022 Pol Henarejos.
+ * Copyright (c) 2026 lazysaltyfish. Modified for RP2350 & YubiKey 5 alignment (2026-10).
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU Affero General Public License as published by
@@ -942,8 +943,22 @@ static int cmd_otp(void) {
         res_APDU[0] &= ~0xFC; // Force 8-digit serial number
         res_APDU_size = 4;
     }
+    else if (p1 == 0x11) { // Set device mode
+        int ret = man_set_mode(apdu.data, (uint16_t)apdu.nc);
+        if (ret != 0x9000) {
+            return (uint16_t)ret;
+        }
+        return otp_status(_is_otp);
+    }
     else if (p1 == 0x13) { // Get config
         man_get_config();
+    }
+    else if (p1 == 0x15) { // Write config
+        int ret = man_write_config(apdu.data, (uint16_t)apdu.nc);
+        if (ret != 0x9000) {
+            return (uint16_t)ret;
+        }
+        return otp_status(_is_otp);
     }
     else if (p1 == 0x14) {
         otp_status_ext();

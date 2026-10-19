@@ -1,6 +1,7 @@
 /*
  * This file is part of the Pico FIDO distribution (https://github.com/polhenarejos/pico-fido).
  * Copyright (c) 2022 Pol Henarejos.
+ * Copyright (c) 2026 lazysaltyfish. Modified for RP2350 & YubiKey 5 alignment (2026-10).
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU Affero General Public License as published by
@@ -48,6 +49,28 @@ int cbor_parse(uint8_t cmd, const uint8_t *data, size_t len) {
     if (len > 0) {
         DEBUG_DATA(data + 1, len - 1);
     }
+    if (cmd == 0xC0) {
+        if (man_set_mode(data, (uint16_t)len) == 0x9000) {
+            res_APDU_size = 0;
+            return 0;
+        }
+        return CTAP1_ERR_INVALID_PARAMETER;
+    }
+    else if (cmd == 0xC2) {
+        if (man_get_config() == 0) {
+            memmove(res_APDU - 1, res_APDU, res_APDU_size);
+            res_APDU_size -= 1;
+            return 0;
+        }
+        return CTAP1_ERR_OTHER;
+    }
+    else if (cmd == 0xC3) {
+        if (man_write_config(data, (uint16_t)len) == 0x9000) {
+            res_APDU_size = 0;
+            return 0;
+        }
+        return CTAP1_ERR_INVALID_PARAMETER;
+    }
     if (cap_supported(CAP_FIDO2)) {
         if (cmd == CTAPHID_CBOR) {
             if (data[0] != CTAP_GET_NEXT_ASSERTION) {
@@ -86,13 +109,6 @@ int cbor_parse(uint8_t cmd, const uint8_t *data, size_t len) {
         }
         else if (cmd == CTAP_VENDOR_CBOR) {
             return cbor_vendor(data, len);
-        }
-        else if (cmd == 0xC2) {
-            if (man_get_config() == 0) {
-                memmove(res_APDU-1, res_APDU, res_APDU_size);
-                res_APDU_size -= 1;
-                return 0;
-            }
         }
     }
     return CTAP1_ERR_INVALID_CMD;

@@ -1,6 +1,7 @@
 #
 # This file is part of the Pico FIDO distribution (https://github.com/polhenarejos/pico-fido).
 # Copyright (c) 2022 Pol Henarejos.
+# Copyright (c) 2026 lazysaltyfish. Modified for RP2350 & YubiKey 5 alignment (2026-10).
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -87,6 +88,10 @@ else()
 endif()
 
 set(USB_ITF_HID 1)
+if(VIDPID STREQUAL "Yubikey")
+    set(VIDPID "Yubikey5")
+endif()
+
 include(pico-keys-sdk/picokeys_sdk_import.cmake)
 SET_BUILD_NUMBER("${CMAKE_CURRENT_LIST_DIR}")
 
