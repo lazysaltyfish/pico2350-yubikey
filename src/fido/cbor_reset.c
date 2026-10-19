@@ -1,6 +1,7 @@
 /*
  * This file is part of the Pico FIDO distribution (https://github.com/polhenarejos/pico-fido).
  * Copyright (c) 2022 Pol Henarejos.
+ * Copyright (c) 2026 lazysaltyfish. Modified for RP2350 & YubiKey 5 alignment (2026-10).
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU Affero General Public License as published by
@@ -35,6 +36,7 @@ static bool fido_reset_should_clear(uint16_t fid) {
     switch (fid) {
         case EF_KEY_DEV:
         case EF_KEY_DEV_ENC:
+        case EF_MKEK:
         case EF_EE_DEV:
         case EF_EE_DEV_EA:
         case EF_VAULT_KEY:

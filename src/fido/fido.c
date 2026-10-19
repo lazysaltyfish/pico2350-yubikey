@@ -1,6 +1,7 @@
 /*
  * This file is part of the Pico FIDO distribution (https://github.com/polhenarejos/pico-fido).
  * Copyright (c) 2022 Pol Henarejos.
+ * Copyright (c) 2026 lazysaltyfish. Modified for RP2350 & YubiKey 5 alignment (2026-10).
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU Affero General Public License as published by
@@ -231,6 +232,72 @@ static int x509_create_cert(mbedtls_ecdsa_context *ecdsa, uint8_t *buffer, size_
     return ret;
 }
 
+#define MKEK_IV_SIZE     16
+#define MKEK_KEY_SIZE    32
+#define MKEK_KEY_CS_SIZE 4
+#define MKEK_SIZE        (MKEK_IV_SIZE + MKEK_KEY_SIZE + MKEK_KEY_CS_SIZE)
+
+#define POLY_CRC32C 0xedb88320
+
+static uint32_t legacy_crc32c(const uint8_t *buf, size_t len) {
+    uint32_t crc = 0xffffffff;
+    while (len--) {
+        crc ^= *buf++;
+        for (int k = 0; k < 8; k++) {
+            crc = (crc >> 1) ^ (POLY_CRC32C & (0 - (crc & 1)));
+        }
+    }
+    return ~crc;
+}
+
+static void legacy_mkek_masked(uint8_t *mkek, const uint8_t *mask) {
+    if (mask) {
+        for (int i = 0; i < 32; i++) {
+            (mkek + 16)[i] ^= mask[i];
+        }
+    }
+}
+
+static int legacy_load_mkek(uint8_t *mkek) {
+    file_t *tf = file_search_by_fid(EF_MKEK, NULL, SPECIFY_EF);
+    if (!tf || !file_has_data(tf)) {
+        return PICOKEYS_ERR_FILE_NOT_FOUND;
+    }
+    uint32_t mkek_size = file_get_size(tf);
+    if (mkek_size != MKEK_IV_SIZE + MKEK_KEY_SIZE && mkek_size != MKEK_SIZE) {
+        return PICOKEYS_ERR_FILE_NOT_FOUND;
+    }
+    memcpy(mkek, file_get_data(tf), mkek_size);
+
+    if (mkek_size == MKEK_SIZE) {
+        int ret = aes_decrypt_cfb_256(session_pin, mkek, BYTE_ARRAY(mkek + MKEK_IV_SIZE, MKEK_KEY_SIZE + MKEK_KEY_CS_SIZE));
+        if (ret != 0) {
+            return PICOKEYS_EXEC_ERROR;
+        }
+        uint32_t stored_crc = 0;
+        memcpy(&stored_crc, mkek + MKEK_IV_SIZE + MKEK_KEY_SIZE, sizeof(stored_crc));
+        if (legacy_crc32c(mkek + MKEK_IV_SIZE, MKEK_KEY_SIZE) != stored_crc) {
+            return PICOKEYS_WRONG_DKEK;
+        }
+    }
+    if (otp_key_1) {
+        legacy_mkek_masked(mkek, otp_key_1);
+    }
+    return PICOKEYS_OK;
+}
+
+static int legacy_mkek_decrypt(uint8_t *data, uint16_t len) {
+    uint8_t mkek[MKEK_SIZE + 4];
+    int r = legacy_load_mkek(mkek);
+    if (r != PICOKEYS_OK) {
+        mbedtls_platform_zeroize(mkek, sizeof(mkek));
+        return r;
+    }
+    r = aes_decrypt_cfb_256(mkek + MKEK_IV_SIZE, mkek, BYTE_ARRAY(data, len));
+    mbedtls_platform_zeroize(mkek, sizeof(mkek));
+    return r;
+}
+
 int load_keydev(uint8_t key[32]) {
     bool pin_wrapped = false;
 
@@ -244,10 +311,43 @@ int load_keydev(uint8_t key[32]) {
     else {
         uint32_t fid_size = file_get_size(ef_keydev);
         if (fid_size == 32) {
-            memcpy(key, file_get_data(ef_keydev), 32);
-            if (otp_key_1 && aes_decrypt(CONST_BYTE_ARRAY(otp_key_1, 32), NULL, PICOKEYS_AES_MODE_CBC, BYTE_ARRAY(key, 32)) != PICOKEYS_OK) {
+            uint8_t raw[32];
+            memcpy(raw, file_get_data(ef_keydev), 32);
+
+            int mret = legacy_mkek_decrypt(raw, 32);
+            if (mret == PICOKEYS_OK) {
+                file_t *ef_mkek = file_search_by_fid(EF_MKEK, NULL, SPECIFY_EF);
+                if (ef_mkek && file_get_size(ef_mkek) == MKEK_SIZE) {
+                    pin_wrapped = true;
+                }
+            }
+            else if (mret != PICOKEYS_ERR_FILE_NOT_FOUND) {
+                mbedtls_platform_zeroize(raw, sizeof(raw));
+                return mret;
+            }
+
+            if (otp_key_1 && aes_decrypt(CONST_BYTE_ARRAY(otp_key_1, 32), NULL, PICOKEYS_AES_MODE_CBC, BYTE_ARRAY(raw, 32)) != PICOKEYS_OK) {
+                mbedtls_platform_zeroize(raw, sizeof(raw));
                 return PICOKEYS_EXEC_ERROR;
             }
+
+            mbedtls_ecdsa_context test_key;
+            mbedtls_ecdsa_init(&test_key);
+            int vret = mbedtls_ecp_read_key(MBEDTLS_ECP_DP_SECP256R1, &test_key, raw, 32);
+            mbedtls_ecdsa_free(&test_key);
+
+            if (vret == 0) {
+                memcpy(key, raw, 32);
+                file_t *ef_pin_local = file_search_by_fid(EF_PIN, NULL, SPECIFY_EF);
+                if (!ef_pin_local || !file_has_data(ef_pin_local)) {
+                    encrypt_keydev_f1(key);
+                }
+            }
+            else {
+                mbedtls_platform_zeroize(raw, sizeof(raw));
+                return PICOKEYS_EXEC_ERROR;
+            }
+            mbedtls_platform_zeroize(raw, sizeof(raw));
         }
         else if (fid_size == 33 || fid_size == 61) {
             uint8_t format = *file_get_data(ef_keydev);

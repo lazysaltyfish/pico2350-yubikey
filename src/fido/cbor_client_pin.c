@@ -1,6 +1,7 @@
 /*
  * This file is part of the Pico FIDO distribution (https://github.com/polhenarejos/pico-fido).
  * Copyright (c) 2022 Pol Henarejos.
+ * Copyright (c) 2026 lazysaltyfish. Modified for RP2350 & YubiKey 5 alignment (2026-10).
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU Affero General Public License as published by
@@ -33,6 +34,7 @@
 #include "random.h"
 #include "crypto_utils.h"
 #include "apdu.h"
+#include "credential.h"
 #include "object_authorization.h"
 
 uint32_t usage_timer = 0, initial_usage_time_limit = 0;
@@ -689,6 +691,16 @@ int cbor_client_pin(const uint8_t *data, size_t len) {
                 CBOR_ERROR(CTAP2_ERR_PIN_INVALID);
             }
             encrypt_keydev_f1(keydev);
+            credential_migrate_rp_secure();
+        }
+        else if (file_get_size(ef_keydev) == 32) {
+            hash_multi(CONST_BYTE_ARRAY(paddedNewPin, 16), session_pin);
+            ret = load_keydev(keydev);
+            if (ret != PICOKEYS_OK) {
+                CBOR_ERROR(CTAP2_ERR_PIN_INVALID);
+            }
+            encrypt_keydev_f1(keydev);
+            credential_migrate_rp_secure();
         }
         pin_derive_session(CONST_BYTE_ARRAY(paddedNewPin, 16), session_pin);
         pin_data[0] = MAX_PIN_RETRIES;
@@ -881,6 +893,16 @@ int cbor_client_pin(const uint8_t *data, size_t len) {
                 CBOR_ERROR(CTAP2_ERR_PIN_INVALID);
             }
             encrypt_keydev_f1(keydev);
+            credential_migrate_rp_secure();
+        }
+        else if (file_get_size(ef_keydev) == 32) {
+            hash_multi(CONST_BYTE_ARRAY(paddedNewPin, 16), session_pin);
+            ret = load_keydev(keydev);
+            if (ret != PICOKEYS_OK) {
+                CBOR_ERROR(CTAP2_ERR_PIN_INVALID);
+            }
+            encrypt_keydev_f1(keydev);
+            credential_migrate_rp_secure();
         }
 
         pin_derive_session(CONST_BYTE_ARRAY(paddedNewPin, 16), session_pin);

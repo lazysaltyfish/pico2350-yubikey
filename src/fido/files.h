@@ -1,6 +1,7 @@
 /*
  * This file is part of the Pico FIDO distribution (https://github.com/polhenarejos/pico-fido).
  * Copyright (c) 2022 Pol Henarejos.
+ * Copyright (c) 2026 lazysaltyfish. Modified for RP2350 & YubiKey 5 alignment (2026-10).
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU Affero General Public License as published by
@@ -22,6 +23,7 @@
 
 #define EF_KEY_DEV      0xCC00
 #define EF_KEY_DEV_ENC  0xCC01
+#define EF_MKEK         0xCC0F
 #define EF_EE_DEV       0xCE00
 #define EF_EE_DEV_EA    0xCE01
 #define EF_VAULT_KEY    0xCE03
