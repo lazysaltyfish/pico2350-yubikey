@@ -17,6 +17,10 @@ The current FIDO Alliance Conformance Test App results are documented in
 Those results show that the tested Pico Fido firmware passed the conformance
 tests captured in that report.
 
+## YubiKey 5 full applet verification
+
+The end-to-end hardware and host verification methodology covering all YubiKey 5 applets (Management, FIDO2/U2F, OATH, OTP, PIV, OpenPGP v3.4, YubiHSM Auth 5.8, and GlobalPlatform Security Domain) is documented in [`yubikey5-verification.md`](./yubikey5-verification.md).
+
 ## Important limitation
 
 Passing the FIDO Alliance conformance tests does **not** mean Pico Fido is

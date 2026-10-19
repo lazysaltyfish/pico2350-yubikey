@@ -49,3 +49,15 @@ Output firmware: `build_waveshare/pico_fido.uf2`
    - Supports legacy `EF_MKEK` (`0xCC0F`) unwrapping for 32-byte `EF_KEY_DEV` (`0xCC00`) and automatic migration to v8.0 format (`0x01`/`0x03`) + encrypted `EF_RP` (`0xD000+`).
    - Preserves full `cred_id` as `cred->residentId` for legacy v6.x resident credentials (`EF_CRED`, `0xCF00+`) that do not have a 42-byte `cred_idr` prefix.
    - Preserves `apdu.rdata`, `apdu.header`, and `ctap_req` across `driver_init_hid()` inside `cmd_cbor()` and `cmd_vendor()` for CCID-wrapped CTAP CBOR commands.
+
+---
+
+## YubiKey 5 Full Applet Verification Guide
+
+To run the complete automated verification suite (Host C unit tests + `authenticator-helper` JSON-RPC + live hardware end-to-end tests across all 8 YubiKey 5 applets), run:
+
+```bash
+python3 tests/verify_yubikey5.py
+```
+
+For the detailed architecture, commands, and individual applet test breakdown, see [`tests/yubikey5-verification.md`](./tests/yubikey5-verification.md).
