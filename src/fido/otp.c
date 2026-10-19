@@ -351,6 +351,7 @@ const uint8_t otp_aid[] = {
 static int otp_select(app_t *a, uint8_t force) {
     (void) force;
     if (cap_supported(CAP_OTP)) {
+        init_otp();
         int ret = otp_migrate_slots();
         if (ret != PICOKEYS_OK) {
             return ret;
@@ -358,7 +359,9 @@ static int otp_select(app_t *a, uint8_t force) {
         a->process_apdu = otp_process_apdu;
         a->unload = otp_unload;
         if (otp_slot_has_data(EF_OTP_SLOT1) || otp_slot_has_data(EF_OTP_SLOT2)) {
-            config_seq = 1;
+            if (config_seq == 0) {
+                config_seq = 1;
+            }
         }
         else {
             config_seq = 0;
@@ -413,6 +416,12 @@ void init_otp(void) {
                 }
             }
             mbedtls_platform_zeroize(data, sizeof(data));
+        }
+        if (otp_slot_has_data(EF_OTP_SLOT1) || otp_slot_has_data(EF_OTP_SLOT2)) {
+            config_seq = 1;
+        }
+        else {
+            config_seq = 0;
         }
         scanned = true;
         flash_commit();
@@ -643,7 +652,7 @@ static uint16_t otp_status(bool is_otp) {
         if (otp_slot_load(EF_OTP_SLOT1, data, &data_len) == PICOKEYS_OK) {
             opts |= CONFIG1_VALID;
             otp_config_t *otp_config = (otp_config_t *)data;
-            if (!(otp_config->tkt_flags & CHAL_RESP) || otp_config->cfg_flags & CHAL_BTN_TRIG) {
+            if (!((otp_config->tkt_flags & CHAL_RESP) && (otp_config->cfg_flags & CHAL_YUBICO)) || (otp_config->cfg_flags & CHAL_BTN_TRIG)) {
                 opts |= CONFIG1_TOUCH;
             }
         }
@@ -655,7 +664,7 @@ static uint16_t otp_status(bool is_otp) {
         if (otp_slot_load(EF_OTP_SLOT2, data, &data_len) == PICOKEYS_OK) {
             opts |= CONFIG2_VALID;
             otp_config_t *otp_config = (otp_config_t *)data;
-            if (!(otp_config->tkt_flags & CHAL_RESP) || otp_config->cfg_flags & CHAL_BTN_TRIG) {
+            if (!((otp_config->tkt_flags & CHAL_RESP) && (otp_config->cfg_flags & CHAL_YUBICO)) || (otp_config->cfg_flags & CHAL_BTN_TRIG)) {
                 opts |= CONFIG2_TOUCH;
             }
         }
@@ -737,7 +746,12 @@ static int cmd_otp(void) {
         if (otp_slot_delete(slot) != PICOKEYS_OK) {
             return SW_MEMORY_FAILURE();
         }
-        config_seq++;
+        if (!otp_slot_has_data(EF_OTP_SLOT1) && !otp_slot_has_data(EF_OTP_SLOT2)) {
+            config_seq = 0;
+        }
+        else {
+            config_seq++;
+        }
         return otp_status(_is_otp);
     }
     else if (p1 == 0x04 || p1 == 0x05) { // Update slot
@@ -777,13 +791,15 @@ static int cmd_otp(void) {
                                (odata->ext_flags & EXTFLAG_UPDATE_MASK);
             odata->tkt_flags = (otpc->tkt_flags & ~TKTFLAG_UPDATE_MASK) |
                                (odata->tkt_flags & TKTFLAG_UPDATE_MASK);
-            if (!(otpc->tkt_flags & CHAL_RESP)) {
+            if (!((otpc->tkt_flags & CHAL_RESP) && (otpc->cfg_flags & CHAL_YUBICO))) {
                 odata->cfg_flags = (otpc->cfg_flags & ~CFGFLAG_UPDATE_MASK) |
                                    (odata->cfg_flags & CFGFLAG_UPDATE_MASK);
             }
             else {
                 odata->cfg_flags = otpc->cfg_flags;
             }
+            uint16_t new_crc = calculate_crc((const uint8_t *)odata, otp_config_size - sizeof(uint16_t));
+            odata->crc = (uint16_t)~new_crc;
             memcpy(current, apdu.data, otp_config_size);
             if (otp_slot_store(slot, current, current_len) != PICOKEYS_OK) {
                 mbedtls_platform_zeroize(current, sizeof(current));
@@ -816,13 +832,21 @@ static int cmd_otp(void) {
             memcpy(access_code, apdu.data + 2, sizeof(access_code));
         }
         else if (apdu.nc != 0) {
-            if (apdu.nc != 2 && apdu.nc != 2 + ACC_CODE_SIZE) {
-                return SW_WRONG_LENGTH();
+            if (apdu.nc == ACC_CODE_SIZE) {
+                memcpy(access_code, apdu.data, sizeof(access_code));
             }
-            slot1 += apdu.data[0];
-            slot2 += apdu.data[1];
-            if (apdu.nc == 2 + ACC_CODE_SIZE) {
-                memcpy(access_code, apdu.data + 2, sizeof(access_code));
+            else if (apdu.nc == otp_config_size + ACC_CODE_SIZE) {
+                memcpy(access_code, apdu.data + otp_config_size, sizeof(access_code));
+            }
+            else if (apdu.nc == 2 || apdu.nc == 2 + ACC_CODE_SIZE) {
+                slot1 += apdu.data[0];
+                slot2 += apdu.data[1];
+                if (apdu.nc == 2 + ACC_CODE_SIZE) {
+                    memcpy(access_code, apdu.data + 2, sizeof(access_code));
+                }
+            }
+            else {
+                return SW_WRONG_LENGTH();
             }
         }
         if (slot1 > EF_OTP_SLOT1 + 3 || slot2 > EF_OTP_SLOT1 + 3 || slot1 == slot2) {
@@ -935,6 +959,34 @@ static int cmd_otp(void) {
         uint8_t session = session_counter[slot1 - EF_OTP_SLOT1];
         session_counter[slot1 - EF_OTP_SLOT1] = session_counter[slot2 - EF_OTP_SLOT1];
         session_counter[slot2 - EF_OTP_SLOT1] = session;
+        config_seq++;
+        return otp_status(_is_otp);
+    }
+    else if (p1 == 0x08 || p1 == 0x09) { // Configure NDEF (Slot 1 / Slot 2)
+        uint16_t slot = (p1 == 0x08) ? EF_OTP_SLOT1 : EF_OTP_SLOT2;
+        bool present = false;
+        if (otp_slot_has_data_status(slot, &present) != PICOKEYS_OK) {
+            return SW_MEMORY_FAILURE();
+        }
+        if (present) {
+            if (apdu.nc >= 54 + ACC_CODE_SIZE) {
+                uint8_t current[OTP_SLOT_PLAIN_MAX] = { 0 };
+                uint16_t current_len = 0;
+                if (otp_slot_load(slot, current, &current_len) != PICOKEYS_OK) {
+                    return SW_MEMORY_FAILURE();
+                }
+                otp_config_t *otpc = (otp_config_t *)current;
+                if (mbedtls_ct_memcmp(otpc->acc_code, apdu.data + 54, ACC_CODE_SIZE) != 0) {
+                    mbedtls_platform_zeroize(current, sizeof(current));
+                    return SW_SECURITY_STATUS_NOT_SATISFIED();
+                }
+                mbedtls_platform_zeroize(current, sizeof(current));
+            }
+            config_seq++;
+        }
+        return otp_status(_is_otp);
+    }
+    else if (p1 == 0x12) { // Update scan map
         config_seq++;
         return otp_status(_is_otp);
     }
@@ -1053,10 +1105,16 @@ static int cmd_otp(void) {
     return SW_OK();
 }
 
+static int cmd_otp_status(void) {
+    return otp_status(false);
+}
+
 #define INS_OTP             0x01
+#define INS_YK2_STATUS      0x03
 
 static const cmd_t cmds[] = {
     { INS_OTP, cmd_otp },
+    { INS_YK2_STATUS, cmd_otp_status },
     { 0x00, 0x0 }
 };
 
