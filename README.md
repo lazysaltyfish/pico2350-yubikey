@@ -1,202 +1,94 @@
-# Pico FIDO
-This project transforms your Raspberry Pi Pico or ESP32 microcontroller into an integrated FIDO Passkey, functioning like a standard USB Passkey for authentication.
+# Pico-YubiKey (RP2350)
 
-If you are looking for a OpenPGP + Fido, see: https://github.com/polhenarejos/pico-fido2. Available through [PicoKey App](https://www.picokeys.com/picokeyapp/ "PicoKey App").
+**Pico-YubiKey** is a dedicated **RP2350** hardware security key firmware that implements full protocol and applet alignment with **YubiKey 5 (`0x1050:0x0407`, Firmware 5.7 / 5.8)**.
 
-## Features
-Pico FIDO includes the following features:
+Unlike the upstream `pico-fido` project (which targeted generic RP2040 and ESP32 boards with partial FIDO/OATH/OTP support), this project is purpose-built for **RP2350** (`waveshare_rp2350_one`, `rp2350-arm-s`) and delivers a complete, multi-transport YubiKey 5 implementation across **USB CCID SmartCard**, **USB HID FIDO2/U2F**, and **USB HID OTP Keyboard** interfaces—fully compatible with **Yubico Authenticator**, **`ykman` (`yubikey-manager`)**, **OpenSC**, **GnuPG**, **OpenSSH (`ed25519-sk` / `ecdsa-sk`)**, and **WebAuthn**.
 
-- CTAP 2.3 / CTAP 1
-- Authenticated passkey export and import through the open-source Pico Vault
-- FIDO 2.3 extensions, including UVM, third-party payments, and PIN complexity policy
-- WebAuthn
-- U2F
-- HMAC-Secret extension
-- CredProtect extension
-- User presence enforcement through physical button
-- User verification with PIN
-- Discoverable credentials (resident keys)
-- Configurable policy to deny creation of resident/discoverable credentials
-- Credential expiration and revocation metadata
-- Credential management
-- ECDSA and EDDSA authentication
-- Support for SECP256R1, SECP384R1, SECP521R1, SECP256K1 and Ed25519 curves
-- App registration and login
-- Device selection
-- Support for vendor configuration
-- Backup with 24 words
-- Secure lock to protect the device from flash dumps
-- Permissions support (MC, GA, CM, ACFG, LBW)
-- Authenticator configuration
-- minPinLength extension
-- Self attestation
-- Enterprise attestation
-- credBlobs extension
-- largeBlobKey extension
-- Large blobs support (2048 bytes max)
-- OATH (based on YKOATH protocol specification)
-- TOTP / HOTP
-- Yubikey One Time Password
-- Challenge-response generation
-- Emulated keyboard interface
-- Button press generates an OTP that is directly typed
-- Yubico Authenticator app compatible
-- Yubico YKMAN compatible
-- Nitrokey nitropy and nitroapp compatible
-- Secure Boot and Secure Lock in RP2350 and ESP32-S3 MCUs
-- One Time Programming to store the master key that encrypts all resident keys and seeds.
-- Rescue interface to allow recovery of the device if it becomes unresponsive or undetectable.
-- LED customization with PicoKey App.
+---
 
-The authenticated credential export and import design is described in Pol
-Henarejos, [*Vaulted Passkeys: A Device-Bound Proposal for Authenticated
-Credential Export and Import*](https://arxiv.org/abs/2608.13806). The proposal
-and implementation notes are also available in
-[`docs/vault`](docs/vault/vaulted_passkeys_proposal.md).
+## Supported YubiKey 5 Applets & Capabilities
 
-All features comply with the specifications. If you encounter unexpected behavior or deviations from the specifications, please open an issue.
+| Applet | AID / Interface | Version | Key Capabilities |
+|--------|-----------------|---------|------------------|
+| **Management** | `A0 00 00 05 27 47 11 17`<br>CCID + CTAPHID (`0xC0`/`0xC2`/`0xC3`) + OTP (`0x11`/`0x13`/`0x15`) | 5.7.x | Dynamic USB/NFC capability bitmasks (`CAP_OTP`, `CAP_U2F`, `CAP_FIDO2`, `CAP_OATH`, `CAP_PIV`, `CAP_OPENPGP`, `CAP_HSMAUTH`), 16-byte configuration lock code (`TAG_CONFIG_LOCK` / `TAG_UNLOCK`), auto-eject & challenge-response timeouts, legacy composite mode switching (`INS_SET_MODE`), and device-wide factory reset (`INS_DEVICE_RESET`). |
+| **FIDO2 / WebAuthn & U2F** | `A0 00 00 06 47 2F 00 01`<br>USB HID FIDO + CCID | CTAP 2.3 / CTAP 1 | Discoverable credentials (Passkeys), `Ed25519` (`ed25519-sk`), `ES256` (`P-256`), `ES384` (`P-384`), `ES512` (`P-521`), `ES256K` (`secp256k1`), PIN/UV Auth Protocols v1 & v2, `credProtect`, `hmac-secret`, `largeBlobKey` / `largeBlobs`, `credBlob`, `minPinLength`, Enterprise Attestation, Pico Vault authenticated export/import, and seamless in-place migration from legacy Pico FIDO v6.x `EF_MKEK` & resident credentials. |
+| **Yubico OATH** | `A0 00 00 05 27 21 01`<br>USB CCID | 5.7.x | TOTP & HOTP credentials, `HMAC-SHA1` / `HMAC-SHA256` / `HMAC-SHA512`, 6 / 7 / 8 digits, PBKDF2-derived access code authentication (`INS_VALIDATE` / `INS_SET_CODE`), per-credential hardware touch requirement with configurable timeout, and both 2-byte (`0x78 <prop>`) and 3-byte (`0x78 0x01 <prop>`) property TLV normalization. |
+| **Yubico OTP** | `A0 00 00 05 27 20 01 01`<br>USB HID Keyboard + CCID | 5.7.x | Dual programmable slots (Slot 1 short press `< 1500 ms`, Slot 2 long press `>= 1500 ms`), Yubico AES-128 modhex OTP, HMAC-SHA1 & Yubico OTP Challenge-Response, OATH-HOTP keyboard emission, Static Password scancode emission, `SLOT_SWAP`, 6-byte access codes, NDEF configuration, custom scan maps, and `prog_seq` state tracking. |
+| **PIV SmartCard** | `A0 00 00 03 08`<br>USB CCID | 5.7.2 | NIST SP 800-73-4 & Yubico PIV 5.7 extensions: 25 key slots (`9A`, `9C`, `9D`, `9E`, retired `82..95`, `F9` attestation) & 35 data objects; `RSA-1024/2048/3072/4096`, `ECC P-256/P-384`, `Ed25519`, `X25519`; `3DES` / `AES-128` / `AES-192` / `AES-256` 9B Management Key single & mutual auth; X.509 slot attestation (`0xF9`), metadata (`0xF7`), key move/delete (`0xF6`), and PIN (`NEVER`/`ONCE`/`ALWAYS`) & touch (`NEVER`/`ALWAYS`/`CACHED`) policies. |
+| **OpenPGP SmartCard** | `D2 76 00 01 24 01`<br>USB CCID | v3.4 (5.7.2) | 4 key slots (`SIG`, `DEC`, `AUT`, `ATT`), algorithm negotiation (`0xFA`) across `RSA-2048/3072/4096`, `secp256r1`, `secp256k1`, `secp384r1`, `secp521r1`, `brainpoolP256r1/P384r1/P512r1`, `Ed25519`, `X25519`; Extended Header List key import (`0xDB`), `PSO:CDS`, `PSO:DECIPHER`, `INTERNAL AUTHENTICATE`; OpenPGP KDF (`0xF9` `KdfNone` & `KdfIterSaltedS2k`), multi-slot certificates (`SELECT DATA` `0xA5`), Private DOs (`0101..0104`), UIF touch policies, X.509 attestation (`0xFB`), and `TERMINATE` / `ACTIVATE`. |
+| **YubiHSM Auth** | `A0 00 00 05 27 21 07 01`<br>USB CCID | 5.8.0 | Up to 32 labeled credentials; AES-128 symmetric (`SCP03` CMAC-AES-128 KDF for `S-ENC`, `S-MAC`, `S-RMAC`) and `EC P-256` asymmetric (`SCP11c` mutual ECDH + X9.63 SHA-256 KDF) session key derivation; 16-byte management key & per-credential passwords with 8-attempt retry counters and optional hardware touch enforcement. |
+| **Security Domain** | `A0 00 00 01 51 00 00 00`<br>USB CCID | GP 2.3 | GlobalPlatform Security Domain (`SCP03` / `SCP11`): Key Information (`0x00E0`), Card Recognition Data (`0x0066`), `CA-KLOC` / `CA-KLCC` Subject Key Identifiers (`0xFF33` / `0xFF34`), Certificate Store bundles (`0xBF21`), on-card ECC key generation across NIST & Brainpool curves (`0xF1`), key deletion (`0xE4`), and Security Domain reset. |
 
-## Security Considerations
-Microcontrollers RP2350 and ESP32-S3 are designed to support secure environments when Secure Boot is enabled, and optionally, Secure Lock. These features allow a master key encryption key (MKEK) to be stored in a one-time programmable (OTP) memory region, which is inaccessible from outside secure code. This master key is then used to encrypt all private and secret keys on the device, protecting sensitive data from potential flash memory dumps.
+---
 
-**However**, the RP2040 microcontroller lacks this level of security hardware, meaning that it cannot provide the same protection. Data stored on its flash memory, including private or master keys, can be easily accessed or dumped, as encryption of the master key itself is not feasible. Consequently, if an RP2040 device is stolen, any stored private or secret keys may be exposed.
+## RP2350 Hardware Security Architecture
 
-## Download
-**If you own an ESP32-S3 board, go to [ESP32 Flasher](https://www.picokeys.com/esp32-flasher/) for flashing your Pico FIDO.**
+- **Target MCU & Board**: Raspberry Pi **RP2350** (`waveshare_rp2350_one`, Cortex-M33 `rp2350-arm-s`, 4 MB Flash).
+- **Hardware OTP Master Key Storage**:
+  - Uses RP2350 hardware One-Time Programmable (OTP) rows (`0xE90` for `otp_key_1` and `0xE80` for `otp_key_2`, with automatic migration from legacy rows `0xEF0`/`0xED0`) to store hardware-bound root secrets inaccessible to external flash dumps when RP2350 Secure Boot and Secure Lock are enabled.
+- **Authenticated Encryption at Rest**:
+  - All sensitive applet states and private keys across FIDO2 (`EF_KEY_DEV`, `EF_CRED`, `EF_RP`), OATH, OTP, PIV (`EF_PIV_STATE`, `EF_PIV_KEY_BASE`), OpenPGP (`EF_OPENPGP_KEY_BASE`), and YubiHSM Auth (`EF_HSMAUTH_CRED_BASE`) are wrapped at rest using **AES-256-GCM** with per-applet HKDF/SHA-256 master keys derived from the hardware root key.
 
-If you own a Raspberry Pico (RP2040 or RP2350), go to [Download page](https://www.picokeys.com/getting-started/), select your vendor and model and download the proper firmware; or go to [Release page](https://www.github.com/polhenarejos/pico-fido/releases/) and download the UF2 file for your board.
+---
 
-UF2 files are shiped with a VID/PID granted by RaspberryPi (2E8A:10FE). If you plan to use it with OpenSC or similar tools, you should modify Info.plist of CCID driver to add these VID/PID or use the [PicoKey App](https://www.picokeys.com/picokeyapp/ "PicoKey App").
+## Build & Flash Instructions
 
-You can use whatever VID/PID for internal purposes, but remember that you are not authorized to distribute the binary with a VID/PID that you do not own.
+### Required Build Options
 
-Note that the [PicoKey App](https://www.picokeys.com/picokeyapp/ "PicoKey App") is the most recommended.
+- `-DPICO_BOARD=waveshare_rp2350_one`: Targets the Waveshare RP2350-One board (`rp2350-arm-s`).
+- `-DVIDPID=Yubikey`: Maps to `Yubikey5` (`0x1050:0x0407`) composite USB descriptors (HID FIDO + HID OTP Keyboard + CCID SmartCard) for out-of-the-box recognition by Yubico Authenticator and `ykman`.
+- `-DENABLE_EDDSA=ON`: **Mandatory** for `Ed25519` support across FIDO2 (`ed25519-sk` Passkeys), PIV (`0xE0`), and OpenPGP v3.4 (`EdDSA`).
 
-## Build for Raspberry Pico
-Before building, ensure you have installed the toolchain for the Pico and that the Pico SDK is properly located on your drive.
+### Option 1: Build with Local Docker Container (`pico-rp2350-builder`)
 
-```sh
-git clone https://github.com/polhenarejos/pico-fido
+```bash
+docker run --rm -v "$PWD":/workspace -w /workspace pico-rp2350-builder bash -c "
+  cmake -B build_waveshare \
+    -DPICO_BOARD=waveshare_rp2350_one \
+    -DPICO_SDK_PATH=/opt/pico-sdk \
+    -DVIDPID=Yubikey \
+    -DENABLE_EDDSA=ON && \
+  cmake --build build_waveshare -j8
+"
+```
+
+### Option 2: Build with Host CMake & Pico SDK
+
+```bash
 git submodule update --init --recursive
-cd pico-fido
-mkdir build
-cd build
-PICO_SDK_PATH=/path/to/pico-sdk cmake .. -DPICO_BOARD=board_type -DUSB_VID=0x1234 -DUSB_PID=0x5678
-make
-```
-Note that `PICO_BOARD`, `USB_VID` and `USB_PID` are optional. If not provided, `pico` board and VID/PID `FEFF:FCFD` will be used.
-
-Additionally, you can pass the `VIDPID=value` parameter to build the firmware with a known VID/PID. The supported values are:
-
-- `NitroHSM`
-- `NitroFIDO2`
-- `NitroStart`
-- `NitroPro`
-- `Nitro3`
-- `Yubikey5`
-- `YubikeyNeo`
-- `YubiHSM`
-- `Gnuk`
-- `GnuPG`
-
-After running `make`, the binary file `pico_fido.uf2` will be generated. To load this onto your Pico board:
-
-1. Put the Pico board into loading mode by holding the `BOOTSEL` button while plugging it in.
-2. Copy the `pico_fido.uf2` file to the new USB mass storage device that appears.
-3. Once the file is copied, the Pico mass storage device will automatically disconnect, and the Pico board will reset with the new firmware.
-4. A blinking LED will indicate that the device is ready to work.
-
-## Led blink
-Pico FIDO uses the led to indicate the current status. Four states are available:
-### Press to confirm
-The Led is almost on all the time. It goes off for 100 miliseconds every second.
-
-![Press to confirm](https://user-images.githubusercontent.com/55573252/162008917-6a730eac-396c-44cc-890e-802294be30a3.gif)
-
-### Idle mode
-In idle mode, the Pico FIDO goes to sleep. It waits for a command and it is awaken by the driver. The Led is almost off all the time. It goes on for 500 milliseconds every second.
-
-![Idle mode](https://user-images.githubusercontent.com/55573252/162008980-d5a5caad-072e-400c-98e3-2c606b4b2af9.gif)
-
-### Active mode
-In active mode, the Pico FIDO is awaken and ready to receive a command. It blinks four times in a second.
-
-![Active](https://user-images.githubusercontent.com/55573252/162008997-1ea8cd7e-5384-4893-9dcb-b473153fc375.gif)
-
-### Processing
-While processing, the Pico FIDO is busy and cannot receive additional commands until the current is processed. In this state, the Led blinks 20 times in a second.
-
-![Processing](https://user-images.githubusercontent.com/55573252/162009007-df45111e-2473-4a92-97c5-15c3cd19babd.gif)
-
-## Driver
-
-Pico FIDO uses the `HID` driver, which is present in all operating systems. It should be detected by all OS and browser/applications just like normal USB FIDO keys.
-
-## Tests
-
-Tests can be found in the `tests` folder. They are based on [FIDO2 tests](https://github.com/solokeys/fido2-tests "FIDO2 tests") from Solokeys but adapted to the [python-fido2](https://github.com/Yubico/python-fido2 "python-fido2") v1.0 package, which is a major refactor from the previous 0.8 version and includes the latest improvements from CTAP 2.1.
-
-To run all tests, use:
-
-```sh
-pytest
+cmake -B build_waveshare \
+  -DPICO_BOARD=waveshare_rp2350_one \
+  -DVIDPID=Yubikey \
+  -DENABLE_EDDSA=ON
+cmake --build build_waveshare -j8
 ```
 
-To run a subset of tests, use the `-k <test>` flag:
+### Flashing
 
-```sh
-pytest -k test_credprotect
+1. Hold the `BOOTSEL` button on the RP2350 board while connecting it via USB (or trigger `bootsel` reboot).
+2. Copy `build_waveshare/pico_fido.uf2` to the mounted `RP2350` USB mass storage volume.
+
+---
+
+## Verification & Testing
+
+A full three-layer automated verification suite is included to validate all 8 YubiKey 5 applets across host unit tests, the Yubico Authenticator desktop JSON-RPC backend (`authenticator-helper`), and live hardware `yubikit`/`ykman` end-to-end tests:
+
+```bash
+# Run Host C unit tests + authenticator-helper JSON-RPC + live hardware 8-applet verification
+python3 tests/verify_yubikey5.py
+
+# Skip Host C unit tests and run live hardware verification only
+python3 tests/verify_yubikey5.py --skip-host
 ```
 
-## License and Commercial Use
+See [`tests/yubikey5-verification.md`](./tests/yubikey5-verification.md) for detailed test architecture and per-applet verification procedures.
 
-This project is available under two editions:
+---
 
-**Community Edition (FOSS)**
-- Released under the GNU Affero General Public License v3 (AGPLv3).
-- You are free to study, modify, and run the code, including for internal evaluation.
-- If you distribute modified binaries/firmware, OR if you run a modified version of this project as a network-accessible service, you must provide the corresponding source code to the users of that binary or service, as required by AGPLv3.
-- No warranty. No SLA. No guaranteed support.
+## License & Attribution
 
-**Enterprise / Commercial Edition**
-- Proprietary license for organizations that want to:
-  - run this in production with multiple users/devices,
-  - integrate it into their own product/appliance,
-  - enforce corporate policies (PIN policy, admin/user roles, revocation),
-  - deploy it as an internal virtualized / cloud-style service,
-  - and *not* be required to publish derivative source code.
-- Base package includes:
-  - commercial license (no AGPLv3 disclosure obligation for your modifications / integration)
-  - onboarding call
-  - access to officially signed builds
-- Optional / on-demand enterprise components that can be added case-by-case:
-  - ability to operate in multi-user / multi-device environments
-  - device inventory, traceability and secure revocation/offboarding
-  - custom attestation, per-organization device identity / anti-cloning
-  - virtualization / internal "HSM or auth backend" service for multiple teams or tenants
-  - post-quantum (PQC) key material handling and secure PQC credential storage
-  - hierarchical deterministic key derivation (HD wallet–style key trees for per-user / per-tenant keys, firmware signing trees, etc.)
-  - cryptographically signed audit trail / tamper-evident logging
-  - dual-control / two-person approval for high-risk operations
-  - secure key escrow / disaster recovery strategy
-  - release-signing / supply-chain hardening toolchain
-  - policy-locked hardened mode ("FIPS-style profile")
-  - priority security-response SLA
-  - white-label demo / pre-sales bundle
-
-Typical licensing models:
-- Internal use (single legal entity, including internal private cloud / virtualized deployments).
-- OEM / Redistribution / Service (ship in your product OR offer it as a service to third parties).
-
-These options are scoped and priced individually depending on which components you actually need.
-
-For commercial licensing and enterprise features, email pol@henarejos.me
-Subject: `ENTERPRISE LICENSE <your company name>`
-
-See `ENTERPRISE.md` for details.
-
-## Credits
-Pico FIDO uses the following libraries or portion of code:
-- MbedTLS for cryptographic operations.
-- TinyUSB for low level USB procedures.
-- TinyCBOR for CBOR parsing and formatting.
+- **License**: Released under the **GNU Affero General Public License v3.0 (AGPL-3.0-only)**. See [`LICENSE`](./LICENSE) for full terms.
+- **Copyright**:
+  - Copyright (c) 2026 `lazysaltyfish` (RP2350 architecture focus, YubiKey 5 Management, PIV 5.7, OpenPGP v3.4, YubiHSM Auth 5.8, GlobalPlatform Security Domain, OATH/OTP alignment, and legacy v6.x migration).
+  - Derived from [polhenarejos/pico-fido](https://github.com/polhenarejos/pico-fido) — Copyright (c) 2022 Pol Henarejos.
