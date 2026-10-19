@@ -35,9 +35,9 @@ Unlike the upstream `pico-fido` project (which targeted generic RP2040 and ESP32
 
 ### Required Build Options
 
-- `-DPICO_BOARD=waveshare_rp2350_one`: Targets the Waveshare RP2350-One board (`rp2350-arm-s`).
-- `-DVIDPID=Yubikey`: Maps to `Yubikey5` (`0x1050:0x0407`) composite USB descriptors (HID FIDO + HID OTP Keyboard + CCID SmartCard) for out-of-the-box recognition by Yubico Authenticator and `ykman`.
-- `-DENABLE_EDDSA=ON`: **Mandatory** for `Ed25519` support across FIDO2 (`ed25519-sk` Passkeys), PIV (`0xE0`), and OpenPGP v3.4 (`EdDSA`).
+- `-DPICO_BOARD=waveshare_rp2350_one` (Default): Targets the Waveshare RP2350-One board (`rp2350-arm-s`).
+- `-DVIDPID=Yubikey` (Default `Yubikey5`): Maps to `Yubikey5` (`0x1050:0x0407`) composite USB descriptors (HID FIDO + HID OTP Keyboard + CCID SmartCard) for out-of-the-box recognition by Yubico Authenticator and `ykman`.
+- `-DENABLE_EDDSA=ON` (Default): **Mandatory** for `Ed25519` support across FIDO2 (`ed25519-sk` Passkeys), PIV (`0xE0`), and OpenPGP v3.4 (`EdDSA`).
 
 ### Option 1: Build with Local Docker Container (`pico-rp2350-builder`)
 
@@ -55,7 +55,6 @@ docker run --rm -v "$PWD":/workspace -w /workspace pico-rp2350-builder bash -c "
 ### Option 2: Build with Host CMake & Pico SDK
 
 ```bash
-git submodule update --init --recursive
 cmake -B build_waveshare \
   -DPICO_BOARD=waveshare_rp2350_one \
   -DVIDPID=Yubikey \

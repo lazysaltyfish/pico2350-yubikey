@@ -310,6 +310,9 @@ def run_host_unit_tests(repo_root: str) -> None:
                 "fido_resident_container_test",
                 "fido_oath_container_test",
                 "fido_otp_container_test",
+                "object_store_test",
+                "object_crypto_provider_test",
+                "object_policy_test",
                 "-j8",
             ],
             cwd=repo_root,
@@ -318,7 +321,7 @@ def run_host_unit_tests(repo_root: str) -> None:
         subprocess.run(["ctest", "--test-dir", build_dir, "--output-on-failure"], cwd=repo_root, check=True)
     finally:
         shutil.rmtree(build_dir, ignore_errors=True)
-    print("   [OK] All 5 Host C Unit Tests Passed!\n")
+    print("   [OK] All 8 Host C Unit Tests Passed!\n")
 
 
 def run_rpc_helper_verification() -> None:

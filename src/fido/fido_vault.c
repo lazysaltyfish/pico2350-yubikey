@@ -25,11 +25,7 @@
 #include "credential.h"
 #include "apdu.h"
 #include "random.h"
-#if defined(ESP_PLATFORM)
-#include "compat/esp_compat.h"
-#else
-#include "compat/board.h"
-#endif
+#include "bsp/board.h"
 #include "crypto_utils.h"
 #include "mbedtls/md.h"
 #include "mbedtls/constant_time.h"

@@ -2,4 +2,5 @@ build*/
 *__pycache__*
 legacy/
 .DS_Store
+third-party/
 

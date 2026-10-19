@@ -15,7 +15,7 @@ cd build_release
 
 PICO_SDK_PATH="${PICO_SDK_PATH:-../../pico-sdk}"
 SECURE_BOOT_PKEY="${SECURE_BOOT_PKEY:-../../ec_private_key.pem}"
-boards=("pico" "pico2")
+boards=("waveshare_rp2350_one" "pico2")
 
 for board_name in "${boards[@]}"
 do

@@ -139,8 +139,8 @@ The symbols are security judgments: `✅` favorable, `❌` unfavorable or expose
 ### Repository implementation sources
 
 8. [`src/fido/fido_vault.c`](../../src/fido/fido_vault.c): `vault_pin_auth`, `vault_export_blob`, `vault_import_blob`, `vault_encode_credential_metadata`, and `vault_vendor_command`.
-9. [`pico-keys-sdk/src/vault.c`](../../pico-keys-sdk/src/vault.c): Vault ID/key derivation, enrollment certificate/serial validation, X448/HKDF/AES-GCM enrollment decoding, and Vault-container integration.
-10. [`pico-keys-sdk/src/fs/vault_container.c`](../../pico-keys-sdk/src/fs/vault_container.c): persistent wrapped-`Kvault` storage and retrieval.
+9. [`src/vault.c`](../../src/vault.c): Vault ID/key derivation, enrollment certificate/serial validation, X448/HKDF/AES-GCM enrollment decoding, and Vault-container integration.
+10. [`src/fs/vault_container.c`](../../src/fs/vault_container.c): persistent wrapped-`Kvault` storage and retrieval.
 11. [`src/fido/credential.c`](../../src/fido/credential.c): `credential_import` validation and imported resident-credential creation.
 12. [`src/fido/cbor_get_assertion.c`](../../src/fido/cbor_get_assertion.c): imported-credential `signCount = 0` behavior and suppression of native counter advancement.
 13. [`pico-vault-enroller/pico_vault_enroller/device.py`](../../pico-vault-enroller/pico_vault_enroller/device.py): PIN token, enrollment ceremony, vendor transport, and certificate acquisition flow.

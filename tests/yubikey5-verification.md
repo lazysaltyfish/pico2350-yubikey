@@ -423,16 +423,11 @@ print("\nALL 8 YUBIKEY 5 APPLETS & 3 USB TRANSPORTS PASSED FULL HARDWARE VERIFIC
 
 ## 4. Host C Unit Tests (`ctest`)
 
-In addition to live hardware testing, the repository includes 5 host C unit test suites for storage containers, encryption providers, and authorization state machines (`fido_object_provider_test`, `fido_object_authorization_test`, `fido_resident_container_test`, `fido_oath_container_test`, `fido_otp_container_test`):
+In addition to live hardware testing, the repository includes 8 host C unit test suites for storage containers, encryption providers, policy engines, and authorization state machines (`fido_object_provider_test`, `fido_object_authorization_test`, `fido_resident_container_test`, `fido_oath_container_test`, `fido_otp_container_test`, `object_store_test`, `object_crypto_provider_test`, `object_policy_test`):
 
 ```bash
 cmake -B build_emul -DENABLE_EMULATION=1 -DVIDPID=Yubikey -DENABLE_EDDSA=ON
-cmake --build build_emul --target \
-  fido_object_provider_test \
-  fido_object_authorization_test \
-  fido_resident_container_test \
-  fido_oath_container_test \
-  fido_otp_container_test -j8
+cmake --build build_emul -j8
 ctest --test-dir build_emul --output-on-failure
 rm -rf build_emul
 ```
