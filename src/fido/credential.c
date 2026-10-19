@@ -1,6 +1,7 @@
 /*
  * This file is part of the Pico FIDO distribution (https://github.com/polhenarejos/pico-fido).
  * Copyright (c) 2022 Pol Henarejos.
+ * Copyright (c) 2026 lazysaltyfish. Modified for RP2350 & YubiKey 5 alignment (2026-10).
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU Affero General Public License as published by
@@ -1018,7 +1019,18 @@ bool credential_resident_matches_rp(const file_t *ef, const uint8_t rp_id_hash[R
 }
 
 bool credential_resident_matches_id(const file_t *ef, const uint8_t *resident_id, size_t resident_id_len) {
-    if (!file_has_data(ef) || !resident_id || resident_id_len != CRED_RESIDENT_LEN) {
+    if (!file_has_data(ef) || !resident_id) {
+        return false;
+    }
+    if (!resident_container_is_marker(ef) && file_get_size(ef) > RP_ID_HASH_LEN &&
+        !credential_is_resident(file_get_data(ef) + RP_ID_HASH_LEN, file_get_size(ef) - RP_ID_HASH_LEN)) {
+        size_t legacy_cred_len = file_get_size(ef) - RP_ID_HASH_LEN;
+        if (resident_id_len == legacy_cred_len &&
+            mbedtls_ct_memcmp(file_get_data(ef) + RP_ID_HASH_LEN, resident_id, legacy_cred_len) == 0) {
+            return true;
+        }
+    }
+    if (resident_id_len != CRED_RESIDENT_LEN) {
         return false;
     }
     fido_resident_metadata_t imported_metadata;
@@ -1172,7 +1184,18 @@ int credential_load_resident(const file_t *ef, const uint8_t *rp_id_hash, Creden
         }
         return ret;
     }
-    return credential_load(file_get_data(ef) + RP_ID_HASH_LEN, file_get_size(ef) - RP_ID_HASH_LEN, rp_id_hash, cred);
+    int ret = credential_load(file_get_data(ef) + RP_ID_HASH_LEN, file_get_size(ef) - RP_ID_HASH_LEN, rp_id_hash, cred);
+    if (ret == 0 && cred->id.present && cred->id.len > 0) {
+        cred->residentId.present = true;
+        cred->residentId.len = cred->id.len;
+        cred->residentId.data = (uint8_t *) calloc(1, cred->id.len);
+        if (cred->residentId.data == NULL) {
+            credential_free(cred);
+            return CTAP2_ERR_PROCESSING;
+        }
+        memcpy(cred->residentId.data, cred->id.data, cred->id.len);
+    }
+    return ret;
 }
 
 int credential_resident_public_key(const file_t *ef, uint8_t **public_key, size_t *public_key_len) {

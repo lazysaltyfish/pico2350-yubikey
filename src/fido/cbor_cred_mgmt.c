@@ -1,6 +1,7 @@
 /*
  * This file is part of the Pico FIDO distribution (https://github.com/polhenarejos/pico-fido).
  * Copyright (c) 2022 Pol Henarejos.
+ * Copyright (c) 2026 lazysaltyfish. Modified for RP2350 & YubiKey 5 alignment (2026-10).
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU Affero General Public License as published by
@@ -142,7 +143,7 @@ int cbor_cred_mgmt(const uint8_t *data, size_t len) {
     }
     CBOR_PARSE_MAP_END(map, 1);
 
-    if ((rpIdHash.present && rpIdHash.len != RP_ID_HASH_LEN) || (credentialId.id.present && credentialId.id.len != CRED_RESIDENT_LEN)) {
+    if ((rpIdHash.present && rpIdHash.len != RP_ID_HASH_LEN) || (credentialId.id.present && (credentialId.id.len < CRED_RESIDENT_LEN || credentialId.id.len > MAX_CRED_ID_LENGTH))) {
         CBOR_ERROR(CTAP1_ERR_INVALID_PARAMETER);
     }
 
