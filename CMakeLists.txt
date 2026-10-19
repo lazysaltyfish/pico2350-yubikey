@@ -80,6 +80,14 @@ configure_bool_option(
     "OpenPGP Application: \t\t disabled"
 )
 
+option(ENABLE_HSMAUTH_APP "Enable/disable YubiHSM Auth application" ON)
+configure_bool_option(
+    ENABLE_HSMAUTH_APP
+    ENABLE_HSMAUTH_APP
+    "YubiHSM Auth Application: \t enabled"
+    "YubiHSM Auth Application: \t disabled"
+)
+
 if(FORBID_DISABLE_AUV)
     add_compile_definitions(FORBID_DISABLE_AUV=1)
 endif()
@@ -96,7 +104,7 @@ if(FORCE_BUTTON_WAIT)
     add_compile_definitions(FORCE_BUTTON_WAIT=1)
 endif()
 
-if(ENABLE_OTP_APP OR ENABLE_OATH_APP OR ENABLE_PIV_APP OR ENABLE_OPENPGP_APP)
+if(ENABLE_OTP_APP OR ENABLE_OATH_APP OR ENABLE_PIV_APP OR ENABLE_OPENPGP_APP OR ENABLE_HSMAUTH_APP)
     set(USB_ITF_CCID 1)
     set(USB_ITF_WCID 1)
 else()
@@ -166,6 +174,12 @@ endif()
 if(ENABLE_OPENPGP_APP)
     list(APPEND SOURCES
         ${CMAKE_CURRENT_LIST_DIR}/src/fido/openpgp.c
+    )
+endif()
+
+if(ENABLE_HSMAUTH_APP)
+    list(APPEND SOURCES
+        ${CMAKE_CURRENT_LIST_DIR}/src/fido/hsmauth.c
     )
 endif()
 
