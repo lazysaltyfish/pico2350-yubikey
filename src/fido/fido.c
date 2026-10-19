@@ -101,9 +101,16 @@ static int fido_select(app_t *a, uint8_t force) {
 extern uint8_t (*get_version_major)(void);
 extern uint8_t (*get_version_minor)(void);
 
+#ifndef ENABLE_EMULATION
+extern char const *string_desc_arr[];
+#endif
+
 INITIALIZER ( fido_ctor ) {
 #if defined(USB_ITF_CCID) || defined(ENABLE_EMULATION)
     ccid_atr = atr_fido;
+#endif
+#ifndef ENABLE_EMULATION
+    string_desc_arr[1] = "lazysaltyfish";
 #endif
     get_version_major = fido_get_version_major;
     get_version_minor = fido_get_version_minor;
