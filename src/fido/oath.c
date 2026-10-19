@@ -167,7 +167,7 @@ static int oath_select(app_t *a, uint8_t force) {
         res_APDU[res_APDU_size++] = 3;
         res_APDU[res_APDU_size++] = PICO_FIDO_VERSION_MAJOR;
         res_APDU[res_APDU_size++] = PICO_FIDO_VERSION_MINOR;
-        res_APDU[res_APDU_size++] = 0;
+        res_APDU[res_APDU_size++] = PICO_FIDO_VERSION_PATCH;
         res_APDU[res_APDU_size++] = TAG_NAME;
         res_APDU[res_APDU_size++] = 8;
         memcpy(res_APDU + res_APDU_size, pico_serial_str, 8); res_APDU_size += 8;
