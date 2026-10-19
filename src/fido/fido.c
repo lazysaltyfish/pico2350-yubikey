@@ -761,8 +761,15 @@ int dev_state_update(dev_state_t state) {
 
 static int cmd_vendor(void) {
     uint8_t *old_buf = res_APDU;
+    uint8_t *old_header = apdu.header;
+    CTAPHID_FRAME *old_req = ctap_req;
     driver_init_hid();
+    ctap_req = NULL;
+    apdu.rdata = old_buf;
+    apdu.header = old_header;
+    res_APDU_size = 0;
     int ret = cbor_vendor(apdu.data, apdu.nc);
+    ctap_req = old_req;
     res_APDU = old_buf;
     if (ret != 0) {
         if (ret < 0 || ret > UINT8_MAX) {
@@ -777,8 +784,15 @@ static int cmd_vendor(void) {
 
 static int cmd_cbor(void) {
     uint8_t *old_buf = res_APDU;
+    uint8_t *old_header = apdu.header;
+    CTAPHID_FRAME *old_req = ctap_req;
     driver_init_hid();
+    ctap_req = NULL;
+    apdu.rdata = old_buf;
+    apdu.header = old_header;
+    res_APDU_size = 0;
     int ret = cbor_parse(0x90, apdu.data, apdu.nc);
+    ctap_req = old_req;
     res_APDU = old_buf;
     if (ret != 0) {
         if (ret < 0 || ret > UINT8_MAX) {
