@@ -64,6 +64,14 @@ configure_bool_option(
     "OTP Application: \t\t disabled"
 )
 
+option(ENABLE_PIV_APP "Enable/disable PIV application" ON)
+configure_bool_option(
+    ENABLE_PIV_APP
+    ENABLE_PIV_APP
+    "PIV Application: \t\t enabled"
+    "PIV Application: \t\t disabled"
+)
+
 if(FORBID_DISABLE_AUV)
     add_compile_definitions(FORBID_DISABLE_AUV=1)
 endif()
@@ -80,7 +88,7 @@ if(FORCE_BUTTON_WAIT)
     add_compile_definitions(FORCE_BUTTON_WAIT=1)
 endif()
 
-if(ENABLE_OTP_APP OR ENABLE_OATH_APP)
+if(ENABLE_OTP_APP OR ENABLE_OATH_APP OR ENABLE_PIV_APP)
     set(USB_ITF_CCID 1)
     set(USB_ITF_WCID 1)
 else()
@@ -138,6 +146,12 @@ if(ENABLE_OTP_APP)
     list(APPEND SOURCES
         ${CMAKE_CURRENT_LIST_DIR}/src/fido/otp_container.c
         ${CMAKE_CURRENT_LIST_DIR}/src/fido/otp.c
+    )
+endif()
+
+if(ENABLE_PIV_APP)
+    list(APPEND SOURCES
+        ${CMAKE_CURRENT_LIST_DIR}/src/fido/piv.c
     )
 endif()
 
