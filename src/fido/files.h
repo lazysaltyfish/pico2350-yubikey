@@ -57,6 +57,8 @@
 #define EF_OPENPGP_PRIV_DO_BASE 0xA230 // OpenPGP private DOs at 0xA230 - 0xA233 (0101..0104)
 #define EF_HSMAUTH_STATE        0xA300
 #define EF_HSMAUTH_CRED_BASE    0xA310 // YubiHSM Auth credentials at 0xA310 - 0xA32F (32 slots)
+#define EF_SD_STATE             0xA400
+#define EF_SD_CERT_BASE         0xA410 // Security Domain cert bundles at 0xA410 - 0xA417 (8 slots)
 
 extern file_t *ef_keydev;
 extern file_t *ef_certdev;

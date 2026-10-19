@@ -88,6 +88,14 @@ configure_bool_option(
     "YubiHSM Auth Application: \t disabled"
 )
 
+option(ENABLE_SD_APP "Enable/disable Security Domain application" ON)
+configure_bool_option(
+    ENABLE_SD_APP
+    ENABLE_SD_APP
+    "Security Domain Application: \t enabled"
+    "Security Domain Application: \t disabled"
+)
+
 if(FORBID_DISABLE_AUV)
     add_compile_definitions(FORBID_DISABLE_AUV=1)
 endif()
@@ -104,7 +112,7 @@ if(FORCE_BUTTON_WAIT)
     add_compile_definitions(FORCE_BUTTON_WAIT=1)
 endif()
 
-if(ENABLE_OTP_APP OR ENABLE_OATH_APP OR ENABLE_PIV_APP OR ENABLE_OPENPGP_APP OR ENABLE_HSMAUTH_APP)
+if(ENABLE_OTP_APP OR ENABLE_OATH_APP OR ENABLE_PIV_APP OR ENABLE_OPENPGP_APP OR ENABLE_HSMAUTH_APP OR ENABLE_SD_APP)
     set(USB_ITF_CCID 1)
     set(USB_ITF_WCID 1)
 else()
@@ -180,6 +188,12 @@ endif()
 if(ENABLE_HSMAUTH_APP)
     list(APPEND SOURCES
         ${CMAKE_CURRENT_LIST_DIR}/src/fido/hsmauth.c
+    )
+endif()
+
+if(ENABLE_SD_APP)
+    list(APPEND SOURCES
+        ${CMAKE_CURRENT_LIST_DIR}/src/fido/securitydomain.c
     )
 endif()
 
