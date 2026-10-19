@@ -289,6 +289,8 @@ if(ENABLE_EMULATION)
     add_compile_definitions(ENABLE_EMULATION)
     SET_VERSION(ver_major ver_minor "${CMAKE_CURRENT_LIST_DIR}/src/fido/version.h")
     enable_testing()
+    find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    add_test(NAME verification_runner_test COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_LIST_DIR}/tests/verification_runner_test.py")
 
     add_executable(fido_client_pin_test tests/fido_client_pin_test.c)
     target_include_directories(fido_client_pin_test PRIVATE ${INCLUDES} ${SYSTEM_INCLUDES})
