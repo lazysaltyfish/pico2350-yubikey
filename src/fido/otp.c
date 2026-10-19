@@ -448,6 +448,14 @@ static int otp_button_pressed(uint8_t slot) {
     if (!cap_supported(CAP_OTP)) {
         return 3;
     }
+#ifndef ENABLE_EMULATION
+    if (slot == 1 && button_pressed_duration >= 1500) {
+        slot = 2;
+    }
+#endif
+    if (slot < 1 || slot > FIDO_OTP_SLOT_COUNT) {
+        return 1;
+    }
     uint16_t slot_ef = EF_OTP_SLOT1 + slot - 1;
     bool present = false;
     if (otp_slot_has_data_status(slot_ef, &present) != PICOKEYS_OK || !present) {
@@ -465,15 +473,17 @@ static int otp_button_pressed(uint8_t slot) {
     }
 #ifdef ENABLE_OATH_APP
     if (otp_config->tkt_flags & OATH_HOTP) {
-        uint8_t tmp_key[KEY_SIZE + 2];
+        uint8_t tmp_key[KEY_SIZE_OATH + 2];
         tmp_key[0] = 0x01;
+        tmp_key[1] = (otp_config->cfg_flags & OATH_HOTP8) ? 8 : 6;
         memcpy(tmp_key + 2, otp_config->aes_key, KEY_SIZE);
+        memcpy(tmp_key + 2 + KEY_SIZE, otp_config->uid, KEY_SIZE_OATH - KEY_SIZE);
         uint64_t imf = 0;
         if (data_len == OTP_SLOT_PLAIN_MAX) {
             imf = get_uint64_be(data + otp_config_size);
         }
         if (imf == 0) {
-            imf = get_uint16_be(otp_config->uid + 4);
+            imf = (uint64_t)get_uint16_be(otp_config->uid + 4) * 16u;
         }
         uint8_t chal[8];
         put_uint64_be(imf, chal);
@@ -482,17 +492,24 @@ static int otp_button_pressed(uint8_t slot) {
         mbedtls_platform_zeroize(tmp_key, sizeof(tmp_key));
         if (ret == PICOKEYS_OK) {
             uint32_t base = otp_config->cfg_flags & OATH_HOTP8 ? 100000000u : 1000000u;
-            uint32_t number = get_uint16_be(res_APDU + 2);
+            uint32_t number = get_uint32_be(res_APDU + 2);
             number %= base;
-            char number_str[9];
+            char out_str[2 * FIXED_SIZE + 9];
+            size_t out_len = 0;
+            uint8_t fsize = otp_config->fixed_size <= FIXED_SIZE ? otp_config->fixed_size : 0;
+            if (fsize > 0) {
+                encode_modhex(otp_config->fixed_data, fsize, (uint8_t *)out_str);
+                out_len = (size_t)fsize * 2u;
+            }
             if (otp_config->cfg_flags & OATH_HOTP8) {
-                sprintf(number_str, "%08lu", (long unsigned int) number);
-                add_keyboard_buffer(CONST_BYTE_ARRAY((const uint8_t *)number_str, 8), true);
+                sprintf(out_str + out_len, "%08lu", (long unsigned int) number);
+                out_len += 8;
             }
             else {
-                sprintf(number_str, "%06lu", (long unsigned int) number);
-                add_keyboard_buffer(CONST_BYTE_ARRAY((const uint8_t *)number_str, 6), true);
+                sprintf(out_str + out_len, "%06lu", (long unsigned int) number);
+                out_len += 6;
             }
+            add_keyboard_buffer(CONST_BYTE_ARRAY((const uint8_t *)out_str, out_len), true);
             imf++;
             uint8_t new_chal[8];
             put_uint64_be(imf, new_chal);
@@ -509,17 +526,23 @@ static int otp_button_pressed(uint8_t slot) {
     }
 #endif
     else if (otp_config->cfg_flags & SHORT_TICKET || otp_config->cfg_flags & STATIC_TICKET) {
-        uint8_t fixed_size = FIXED_SIZE + UID_SIZE + KEY_SIZE;
-        if (otp_config->cfg_flags & SHORT_TICKET) { // Not clear which is the purpose of SHORT_TICKET
-            //fixed_size /= 2;
+        uint8_t max_size = FIXED_SIZE + UID_SIZE + KEY_SIZE;
+        if (otp_config->fixed_size > 0 && otp_config->fixed_size < max_size) {
+            max_size = otp_config->fixed_size;
         }
-        add_keyboard_buffer(CONST_BYTE_ARRAY(otp_config->fixed_data, fixed_size), false);
+        uint8_t scancode_len = 0;
+        while (scancode_len < max_size && otp_config->fixed_data[scancode_len] != 0) {
+            scancode_len++;
+        }
+        add_keyboard_buffer(CONST_BYTE_ARRAY(otp_config->fixed_data, scancode_len), false);
         if (otp_config->tkt_flags & APPEND_CR) {
             append_keyboard_buffer(CONST_BYTE_ARRAY((const uint8_t *)"\x28", 1));
         }
     }
     else {
-        uint8_t otpk[22], *po = otpk;
+        uint8_t fsize = otp_config->fixed_size <= FIXED_SIZE ? otp_config->fixed_size : 6;
+        uint8_t otpk[FIXED_SIZE + 16];
+        uint8_t *po = otpk;
         bool update_counter = false;
         uint16_t counter = data_len == OTP_SLOT_PLAIN_MAX ? get_uint16_be(data + otp_config_size) : 0;
         uint16_t crc = 0;
@@ -528,8 +551,11 @@ static int otp_button_pressed(uint8_t slot) {
             update_counter = true;
             counter = 1;
         }
-        memcpy(po, otp_config->fixed_data, 6);
-        po += 6;
+        if (fsize > 0) {
+            memcpy(po, otp_config->fixed_data, fsize);
+            po += fsize;
+        }
+        uint8_t *enc_block = po;
         memcpy(po, otp_config->uid, UID_SIZE);
         po += UID_SIZE;
         po += put_uint16_le(counter, po);
@@ -540,15 +566,16 @@ static int otp_button_pressed(uint8_t slot) {
         *po++ = session_counter[slot - 1];
         random_fill_buffer(BYTE_ARRAY(po, 2));
         po += 2;
-        crc = calculate_crc(otpk + 6, 14);
+        crc = calculate_crc(enc_block, 14);
         po += put_uint16_le(~crc, po);
         mbedtls_aes_context ctx;
         mbedtls_aes_init(&ctx);
         mbedtls_aes_setkey_enc(&ctx, otp_config->aes_key, 128);
-        mbedtls_aes_crypt_ecb(&ctx, MBEDTLS_AES_ENCRYPT, otpk + 6, otpk + 6);
+        mbedtls_aes_crypt_ecb(&ctx, MBEDTLS_AES_ENCRYPT, enc_block, enc_block);
         mbedtls_aes_free(&ctx);
-        uint8_t otp_out[44];
-        encode_modhex(otpk, sizeof(otpk), otp_out);
+        uint8_t otp_out[2 * (FIXED_SIZE + 16)];
+        size_t total_raw = (size_t)fsize + 16u;
+        encode_modhex(otpk, total_raw, otp_out);
         mbedtls_platform_zeroize(otpk, sizeof(otpk));
         uint8_t next_session_counter = (uint8_t)(session_counter[slot - 1] + 1);
         if (next_session_counter == 0) {
@@ -570,7 +597,7 @@ static int otp_button_pressed(uint8_t slot) {
             flash_commit();
         }
         session_counter[slot - 1] = next_session_counter;
-        add_keyboard_buffer(CONST_BYTE_ARRAY((const uint8_t *)otp_out, sizeof(otp_out)), true);
+        add_keyboard_buffer(CONST_BYTE_ARRAY((const uint8_t *)otp_out, total_raw * 2u), true);
         if (otp_config->tkt_flags & APPEND_CR) {
             append_keyboard_buffer(CONST_BYTE_ARRAY((const uint8_t *)"\r", 1));
         }
