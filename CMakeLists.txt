@@ -72,6 +72,14 @@ configure_bool_option(
     "PIV Application: \t\t disabled"
 )
 
+option(ENABLE_OPENPGP_APP "Enable/disable OpenPGP application" ON)
+configure_bool_option(
+    ENABLE_OPENPGP_APP
+    ENABLE_OPENPGP_APP
+    "OpenPGP Application: \t\t enabled"
+    "OpenPGP Application: \t\t disabled"
+)
+
 if(FORBID_DISABLE_AUV)
     add_compile_definitions(FORBID_DISABLE_AUV=1)
 endif()
@@ -88,7 +96,7 @@ if(FORCE_BUTTON_WAIT)
     add_compile_definitions(FORCE_BUTTON_WAIT=1)
 endif()
 
-if(ENABLE_OTP_APP OR ENABLE_OATH_APP OR ENABLE_PIV_APP)
+if(ENABLE_OTP_APP OR ENABLE_OATH_APP OR ENABLE_PIV_APP OR ENABLE_OPENPGP_APP)
     set(USB_ITF_CCID 1)
     set(USB_ITF_WCID 1)
 else()
@@ -152,6 +160,12 @@ endif()
 if(ENABLE_PIV_APP)
     list(APPEND SOURCES
         ${CMAKE_CURRENT_LIST_DIR}/src/fido/piv.c
+    )
+endif()
+
+if(ENABLE_OPENPGP_APP)
+    list(APPEND SOURCES
+        ${CMAKE_CURRENT_LIST_DIR}/src/fido/openpgp.c
     )
 endif()
 

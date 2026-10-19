@@ -51,6 +51,10 @@
 #define EF_PIV_STATE    0xA000
 #define EF_PIV_KEY_BASE 0xA010 // PIV keys at 0xA010 - 0xA028 (25 slots)
 #define EF_PIV_OBJ_BASE 0xA100 // PIV objects at 0xA100 - 0xA12F
+#define EF_OPENPGP_STATE        0xA200
+#define EF_OPENPGP_KEY_BASE     0xA210 // OpenPGP keys at 0xA210 - 0xA213 (SIG, DEC, AUT, ATT)
+#define EF_OPENPGP_CERT_BASE    0xA220 // OpenPGP certs at 0xA220 - 0xA223 (AUT, DEC, SIG, ATT)
+#define EF_OPENPGP_PRIV_DO_BASE 0xA230 // OpenPGP private DOs at 0xA230 - 0xA233 (0101..0104)
 
 extern file_t *ef_keydev;
 extern file_t *ef_certdev;

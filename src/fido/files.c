@@ -40,6 +40,7 @@ file_entry_t file_entries[] = {
     { .fid = EF_PIN_ADMIN,  .parent = 0, .name = NULL, .type = FILE_TYPE_INTERNAL_EF | FILE_DATA_FLASH, .data = NULL, .ef_structure = FILE_EF_TRANSPARENT, .acl = ACL_NONE }, // ADMIN PIN
     { .fid = EF_DEV_CONF, .parent = 0, .name = NULL, .type = FILE_TYPE_INTERNAL_EF | FILE_DATA_FLASH, .data = NULL, .ef_structure = FILE_EF_TRANSPARENT, .acl = ACL_NONE }, // Device Config
     { .fid = EF_PIV_STATE, .parent = 0, .name = NULL, .type = FILE_TYPE_INTERNAL_EF | FILE_DATA_FLASH, .data = NULL, .ef_structure = FILE_EF_TRANSPARENT, .acl = ACL_NONE }, // PIV State
+    { .fid = EF_OPENPGP_STATE, .parent = 0, .name = NULL, .type = FILE_TYPE_INTERNAL_EF | FILE_DATA_FLASH, .data = NULL, .ef_structure = FILE_EF_TRANSPARENT, .acl = ACL_NONE }, // OpenPGP State
     { .fid = 0x0000, .parent = 0xff, .name = NULL, .type = FILE_TYPE_NOT_KNOWN, .data = NULL, .ef_structure = 0, .acl = { 0 } }  //end
 };
 
