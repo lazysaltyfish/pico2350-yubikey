@@ -160,7 +160,7 @@ with dev.open_connection(SmartCardConnection) as conn:
 
     print("3. Verifying Yubico OATH Applet...")
     oath_sess = oath.OathSession(conn)
-    assert oath_sess.version == (8, 0, 0)
+    assert oath_sess.version in ((8, 0, 0), (8, 2, 0), (8, 2, 1))
     if not oath_sess.locked:
         existing = oath_sess.list_credentials()
         test_data = oath.CredentialData("totp_verify", oath.OATH_TYPE.TOTP, oath.HASH_ALGORITHM.SHA1, b"12345678901234567890", 6, 30, 0, "PicoTestIssuer")

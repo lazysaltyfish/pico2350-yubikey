@@ -40,7 +40,7 @@ const uint8_t man_aid[] = {
 static int man_select(app_t *a, uint8_t force) {
     a->process_apdu = man_process_apdu;
     a->unload = man_unload;
-    sprintf((char *) res_APDU, "%d.%d.0", PICO_FIDO_VERSION_MAJOR, PICO_FIDO_VERSION_MINOR);
+    sprintf((char *) res_APDU, "%d.%d.%d", PICO_FIDO_VERSION_MAJOR, PICO_FIDO_VERSION_MINOR, PICO_FIDO_VERSION_PATCH);
     res_APDU_size = (uint16_t)strlen((char *) res_APDU);
     apdu.ne = res_APDU_size;
     if (force) {
@@ -294,7 +294,7 @@ int man_get_config(void) {
     res_APDU[res_APDU_size++] = 3;
     res_APDU[res_APDU_size++] = PICO_FIDO_VERSION_MAJOR;
     res_APDU[res_APDU_size++] = PICO_FIDO_VERSION_MINOR;
-    res_APDU[res_APDU_size++] = 0;
+    res_APDU[res_APDU_size++] = PICO_FIDO_VERSION_PATCH;
 
     res_APDU[res_APDU_size++] = TAG_USB_ENABLED;
     res_APDU[res_APDU_size++] = 2;

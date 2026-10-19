@@ -670,7 +670,7 @@ static uint16_t otp_status(bool is_otp) {
     }
     res_APDU[res_APDU_size++] = PICO_FIDO_VERSION_MAJOR;
     res_APDU[res_APDU_size++] = PICO_FIDO_VERSION_MINOR;
-    res_APDU[res_APDU_size++] = 0;
+    res_APDU[res_APDU_size++] = PICO_FIDO_VERSION_PATCH;
     res_APDU[res_APDU_size++] = config_seq;
     uint8_t opts = 0;
     if (otp_slot_has_data(EF_OTP_SLOT1)) {
