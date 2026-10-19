@@ -48,6 +48,9 @@
 #define EF_OTP_SLOT3    0xBB02
 #define EF_OTP_SLOT4    0xBB03
 #define EF_OTP_PIN      0x10A0 // Nitrokey OTP PIN
+#define EF_PIV_STATE    0xA000
+#define EF_PIV_KEY_BASE 0xA010 // PIV keys at 0xA010 - 0xA028 (25 slots)
+#define EF_PIV_OBJ_BASE 0xA100 // PIV objects at 0xA100 - 0xA12F
 
 extern file_t *ef_keydev;
 extern file_t *ef_certdev;
