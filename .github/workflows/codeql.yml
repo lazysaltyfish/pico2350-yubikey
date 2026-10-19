@@ -13,17 +13,17 @@ name: "CodeQL"
 
 on:
   push:
-    branches: [ "main", "development", "eddsa" ]
+    branches: [ "main", "dev", "dev-clean" ]
   pull_request:
     # The branches below must be a subset of the branches above
-    branches: [ "main", "development", "eddsa" ]
+    branches: [ "main", "dev", "dev-clean" ]
   schedule:
     - cron: '23 5 * * 4'
   workflow_dispatch:
 
 jobs:
   analyze:
-    name: Analyze
+    name: Analyze (${{ matrix.language }}-${{ matrix.mode }})
     runs-on: ubuntu-latest
     permissions:
       actions: read
@@ -33,10 +33,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        language: [ 'cpp', 'python' ]
-        # CodeQL supports [ 'cpp', 'csharp', 'go', 'java', 'javascript', 'python', 'ruby' ]
-        # Learn more about CodeQL language support at https://aka.ms/codeql-docs/language-support
-        mode: [ 'pico', 'local' ]
+        include:
+          - language: 'cpp'
+            mode: 'pico'
+          - language: 'cpp'
+            mode: 'local'
+          - language: 'python'
+            mode: 'none'
 
     steps:
     - name: Checkout repository
@@ -51,28 +54,14 @@ jobs:
         languages: ${{ matrix.language }}
         build-mode: none
         trap-caching: false
-        # If you wish to specify custom queries, you can do so here or in a config file.
-        # By default, queries listed here will override any specified in a config file.
-        # Prefix the list here with "+" to use these queries and those in the config file.
 
-        # Details on CodeQL's query packs refer to : https://docs.github.com/en/code-security/code-scanning/automatically-scanning-your-code-for-vulnerabilities-and-errors/configuring-code-scanning#using-queries-in-ql-packs
-        # queries: security-extended,security-and-quality
-
-
-    # Autobuild attempts to build any compiled languages  (C/C++, C#, or Java).
-    # If this step fails, then you should remove it and run the build manually (see below)
-    # - name: Autobuild
-    #  uses: github/codeql-action/autobuild@v2
-
-    # ℹ️ Command-line programs to run using the OS shell.
-    # 📚 See https://docs.github.com/en/actions/using-workflows/workflow-syntax-for-github-actions#jobsjob_idstepsrun
-
-    #   If the Autobuild fails above, remove it and uncomment the following three lines.
-    #   modify them (or add more) to build your code if your project, please refer to the EXAMPLE below for guidance.
-
-    - run: |
-       echo "Run, Build Application using script"
-       ./workflows/autobuild.sh ${{ matrix.mode }}
+    - name: Build application dependencies and targets
+      if: matrix.language == 'cpp'
+      run: |
+        echo "Run, Build Application using script"
+        ./workflows/autobuild.sh ${{ matrix.mode }}
 
     - name: Perform CodeQL Analysis
       uses: github/codeql-action/analyze@v4
+      with:
+        category: "/language:${{ matrix.language }}/mode:${{ matrix.mode }}"

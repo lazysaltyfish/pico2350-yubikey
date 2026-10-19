@@ -1,22 +1,11 @@
-# For most projects, this workflow file will not need changing; you simply need
-# to commit it to your repository.
-#
-# You may wish to alter this file to override the set of languages analyzed,
-# or to provide custom queries or build logic.
-#
-# ******** NOTE ********
-# We have attempted to detect the languages in your repository. Please check
-# the `language` matrix defined below to confirm you have the correct set of
-# supported CodeQL languages.
-#
-name: "Emulation and test"
+name: "Build and test"
 
 on:
   push:
-    branches: [ "main", "development", "eddsa" ]
+    branches: [ "main", "dev", "dev-clean" ]
   pull_request:
     # The branches below must be a subset of the branches above
-    branches: [ "main", "development", "eddsa" ]
+    branches: [ "main", "dev", "dev-clean" ]
   schedule:
     - cron: '23 5 * * 4'
   workflow_dispatch:
@@ -25,42 +14,36 @@ permissions:
   contents: read
 
 jobs:
-  build:
-
+  host-unit-tests:
+    name: Host C unit tests
     runs-on: ubuntu-latest
     permissions:
       contents: read
 
     steps:
-    - name: Checkout repository and submodules
+    - name: Checkout repository
       uses: actions/checkout@v6
       with:
-        submodules: recursive
         persist-credentials: false
-    - name: Checkout legacy firmware and submodules
+    - name: Build and run host C unit tests
+      run: ./workflows/autobuild.sh local
+
+  firmware-build:
+    name: RP2350 firmware build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+    - name: Checkout repository
       uses: actions/checkout@v6
       with:
-        ref: 43cf570ac3ba4ad8a40685d4bf2c7ccb8d43b2fa
-        path: legacy
-        submodules: recursive
         persist-credentials: false
-    - name: Build in container
-      run: ./tests/build-in-docker.sh
-    - name: Build legacy emulator in container
-      run: ./tests/build-legacy-in-docker.sh
-    - name: Validate Vault test secrets
+    - name: Build RP2350 firmware
       env:
-        PICO_FIDO_VAULT_ENROLLMENT_JSON: ${{ secrets.PICO_FIDO_VAULT_ENROLLMENT_JSON }}
-        PICO_FIDO_VAULT_PASSPHRASE: ${{ secrets.PICO_FIDO_VAULT_PASSPHRASE }}
+        PICO_SDK_PATH: ${{ github.workspace }}/pico-sdk
       run: |
-        test -n "$PICO_FIDO_VAULT_ENROLLMENT_JSON" || { echo "PICO_FIDO_VAULT_ENROLLMENT_JSON is required." >&2; exit 1; }
-        test -n "$PICO_FIDO_VAULT_PASSPHRASE" || { echo "PICO_FIDO_VAULT_PASSPHRASE is required." >&2; exit 1; }
-    - name: Start emulation and test
-      env:
-        PICO_FIDO_VAULT_ENROLLMENT_JSON: ${{ secrets.PICO_FIDO_VAULT_ENROLLMENT_JSON }}
-        PICO_FIDO_VAULT_PASSPHRASE: ${{ secrets.PICO_FIDO_VAULT_PASSPHRASE }}
-      run: ./tests/run-test-in-docker.sh
-    - name: Test legacy flash compatibility
-      run: ./tests/run-test-041-in-docker.sh
-    - name: Test silent authentication after restart
-      run: ./tests/run-test-042-in-docker.sh
+        ./workflows/autobuild.sh pico
+        ./build_pico_fido.sh
+        test -s release/pico_fido_waveshare_rp2350_one-*.uf2
+        test -s release/pico_fido_pico2-*.uf2

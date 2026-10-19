@@ -13,45 +13,38 @@ jobs:
     name: Deploy nightly
     permissions:
       contents: write
-    strategy:
-      fail-fast: false
-      matrix:
-        refs: [main, development]
     runs-on: ubuntu-latest
     env:
-      SIGNING_KEY_PATH: ${{ github.workspace }}/../private.pem
+      SIGNING_KEY_PATH: ${{ runner.temp }}/private.pem
     steps:
-      - name: Validate signing secret
-        run: |
-          test -n "${{ secrets.PRIVATE_KEY_B64 }}" || {
-            echo "PRIVATE_KEY_B64 is required for nightly signed releases." >&2
-            exit 1
-          }
       - name: Checkout repository
         uses: actions/checkout@v6
         with:
-          ref: ${{ matrix.refs }}
-          submodules: 'recursive'
           persist-credentials: false
       - name: Restore private key
-        run: |
-          echo "${{ secrets.PRIVATE_KEY_B64 }}" | base64 -d > "${SIGNING_KEY_PATH}"
-          chmod 600 "${SIGNING_KEY_PATH}"
-      - name : Build
         env:
-          PICO_SDK_PATH: ../pico-sdk
-          SECURE_BOOT_PKEY: ${{ github.workspace }}/../private.pem
+          PRIVATE_KEY_B64: ${{ secrets.PRIVATE_KEY_B64 }}
         run: |
-           ./workflows/autobuild.sh pico
-           ./build_pico_fido.sh --no-eddsa
-           ./workflows/autobuild.sh esp32
+          if [ -n "${PRIVATE_KEY_B64}" ]; then
+            echo "${PRIVATE_KEY_B64}" | base64 -d > "${SIGNING_KEY_PATH}"
+            chmod 600 "${SIGNING_KEY_PATH}"
+          else
+            echo "PRIVATE_KEY_B64 not set; building unsigned RP2350 UF2 images."
+          fi
+      - name: Build RP2350 firmware
+        env:
+          PICO_SDK_PATH: ${{ github.workspace }}/pico-sdk
+          SECURE_BOOT_PKEY: ${{ runner.temp }}/private.pem
+        run: |
+          ./workflows/autobuild.sh pico
+          ./build_pico_fido.sh
       - name: Delete private key
         if: always()
         run: rm -f "${SIGNING_KEY_PATH}"
       - name: Update nightly release
         uses: pyTooling/Actions/releaser@v6.7.0
         with:
-          tag: nightly-${{ matrix.refs }}
+          tag: nightly-${{ github.ref_name }}
           rm: true
           token: ${{ secrets.GITHUB_TOKEN }}
           files: release/*.*
