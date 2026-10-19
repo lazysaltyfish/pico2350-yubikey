@@ -1,6 +1,7 @@
 /*
  * This file is part of the Pico FIDO distribution (https://github.com/polhenarejos/pico-fido).
  * Copyright (c) 2022 Pol Henarejos.
+ * Copyright (c) 2026 lazysaltyfish. Modified for RP2350 & YubiKey 5 alignment (2026-10).
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU Affero General Public License as published by
@@ -18,6 +19,7 @@
 #include "picokeys.h"
 #include "serial.h"
 #include "fido.h"
+#include "button.h"
 #include "apdu.h"
 #include "files.h"
 #include "random.h"
@@ -214,6 +216,18 @@ static int oath_require_otp_pin(void) {
         return SW_SECURITY_STATUS_NOT_SATISFIED();
     }
     return SW_OK();
+}
+
+static bool oath_check_touch_presence(void) {
+#ifdef ENABLE_EMULATION
+    return check_user_presence();
+#else
+    uint32_t timeout_s = button_timeout_seconds();
+    if (timeout_s == 0) {
+        timeout_s = 15;
+    }
+    return wait_button_pressed_timeout(timeout_s) == 0;
+#endif
 }
 
 static bool oath_key_is_secure(const uint8_t *data, size_t len) {
@@ -632,56 +646,168 @@ static bool find_oath_cred(const uint8_t *name, size_t name_len, uint16_t *fid) 
     return false;
 }
 
+static int oath_normalize_put_data(const uint8_t *in, size_t in_len, uint8_t **out_buf, size_t *out_len) {
+    if (!in || in_len == 0 || !out_buf || !out_len || in_len > UINT16_MAX - 16) {
+        return PICOKEYS_ERR_NULL_PARAM;
+    }
+    uint8_t *buf = (uint8_t *)calloc(1, in_len + 16);
+    if (!buf) {
+        return PICOKEYS_ERR_NO_MEMORY;
+    }
+    size_t rpos = 0;
+    size_t wpos = 0;
+    bool has_name = false;
+    bool has_key = false;
+    bool has_imf = false;
+    uint8_t key_type_alg = 0;
+
+    while (rpos < in_len) {
+        uint8_t tag = in[rpos];
+        size_t rem = in_len - rpos;
+        if (tag == TAG_PROPERTY) {
+            if (rem < 2) {
+                mbedtls_platform_zeroize(buf, in_len + 16);
+                free(buf);
+                return PICOKEYS_WRONG_DATA;
+            }
+            uint8_t prop_val = 0;
+            bool is_two_byte = false;
+            if (rem == 2) {
+                is_two_byte = true;
+            }
+            else if (in[rpos + 1] != 0x01) {
+                is_two_byte = true;
+            }
+            else if (rem >= 4 && in[rpos + 2] == TAG_IMF && (size_t)(2 + 2 + in[rpos + 3]) == rem) {
+                is_two_byte = true;
+            }
+            if (is_two_byte) {
+                prop_val = in[rpos + 1];
+                rpos += 2;
+            }
+            else {
+                prop_val = in[rpos + 2];
+                rpos += 3;
+            }
+            buf[wpos++] = TAG_PROPERTY;
+            buf[wpos++] = 1;
+            buf[wpos++] = prop_val;
+            continue;
+        }
+
+        uint8_t *p = (uint8_t *)(in + rpos);
+        tlv_ctx_t sub_ctx = { .data = p, .len = (uint16_t)rem };
+        tlv_item_t item;
+        uint8_t *walk_p = NULL;
+        if (!tlv_walk(&sub_ctx, &walk_p, &item)) {
+            mbedtls_platform_zeroize(buf, in_len + 16);
+            free(buf);
+            return PICOKEYS_WRONG_DATA;
+        }
+        size_t consumed = (size_t)(walk_p - p);
+        if (item.tag == TAG_NAME) {
+            if (item.value.len == 0) {
+                mbedtls_platform_zeroize(buf, in_len + 16);
+                free(buf);
+                return PICOKEYS_ERR_NULL_PARAM;
+            }
+            has_name = true;
+            memcpy(buf + wpos, p, consumed);
+            wpos += consumed;
+        }
+        else if (item.tag == TAG_KEY) {
+            if (item.value.len < 2) {
+                mbedtls_platform_zeroize(buf, in_len + 16);
+                free(buf);
+                return PICOKEYS_WRONG_DATA;
+            }
+            uint8_t oath_type = item.value.data[0] & OATH_TYPE_MASK;
+            uint8_t oath_alg = item.value.data[0] & ALG_MASK;
+            uint8_t digits = item.value.data[1];
+            if ((oath_type != OATH_TYPE_HOTP && oath_type != OATH_TYPE_TOTP) ||
+                (oath_alg != ALG_HMAC_SHA1 && oath_alg != ALG_HMAC_SHA256 && oath_alg != ALG_HMAC_SHA512) ||
+                (digits < 6 || digits > 8)) {
+                mbedtls_platform_zeroize(buf, in_len + 16);
+                free(buf);
+                return PICOKEYS_WRONG_DATA;
+            }
+            has_key = true;
+            key_type_alg = item.value.data[0];
+            memcpy(buf + wpos, p, consumed);
+            wpos += consumed;
+        }
+        else if (item.tag == TAG_IMF) {
+            if (item.value.len > 8) {
+                mbedtls_platform_zeroize(buf, in_len + 16);
+                free(buf);
+                return PICOKEYS_WRONG_DATA;
+            }
+            has_imf = true;
+            buf[wpos++] = TAG_IMF;
+            buf[wpos++] = 8;
+            size_t pad = 8 - item.value.len;
+            if (pad > 0) {
+                memset(buf + wpos, 0, pad);
+            }
+            if (item.value.len > 0) {
+                memcpy(buf + wpos + pad, item.value.data, item.value.len);
+            }
+            wpos += 8;
+        }
+        else {
+            memcpy(buf + wpos, p, consumed);
+            wpos += consumed;
+        }
+        rpos += consumed;
+    }
+
+    if (!has_name || !has_key) {
+        mbedtls_platform_zeroize(buf, in_len + 16);
+        free(buf);
+        return PICOKEYS_ERR_NULL_PARAM;
+    }
+
+    if ((key_type_alg & OATH_TYPE_MASK) == OATH_TYPE_HOTP && !has_imf) {
+        buf[wpos++] = TAG_IMF;
+        buf[wpos++] = 8;
+        memset(buf + wpos, 0, 8);
+        wpos += 8;
+    }
+
+    *out_buf = buf;
+    *out_len = wpos;
+    return PICOKEYS_OK;
+}
+
 static int cmd_put(void) {
     if (validated == false) {
         return SW_SECURITY_STATUS_NOT_SATISFIED();
     }
-    tlv_ctx_t ctxi, key = { 0 }, name = { 0 }, imf = { 0 };
-    tlv_ctx_init(BYTE_ARRAY(apdu.data, apdu.nc), &ctxi);
-    if (tlv_find_tag(&ctxi, TAG_KEY, &key) == false) {
+    if (apdu.nc == 0) {
         return SW_INCORRECT_PARAMS();
     }
-    if (key.len < 2) {
+    uint8_t *put_copy = NULL;
+    size_t put_len = 0;
+    int norm_ret = oath_normalize_put_data(apdu.data, apdu.nc, &put_copy, &put_len);
+    if (norm_ret == PICOKEYS_ERR_NULL_PARAM) {
+        return SW_INCORRECT_PARAMS();
+    }
+    if (norm_ret != PICOKEYS_OK) {
         return SW_WRONG_DATA();
     }
+
+    tlv_ctx_t ctxi, name = { 0 };
+    tlv_ctx_init(BYTE_ARRAY(put_copy, put_len), &ctxi);
     if (tlv_find_tag(&ctxi, TAG_NAME, &name) == false) {
+        mbedtls_platform_zeroize(put_copy, put_len);
+        free(put_copy);
         return SW_INCORRECT_PARAMS();
     }
-    uint8_t *put_data = apdu.data;
-    size_t put_len = apdu.nc;
-    uint8_t *put_copy = NULL;
-    if ((key.data[0] & OATH_TYPE_MASK) == OATH_TYPE_HOTP) {
-        if (apdu.nc > UINT16_MAX - 10) {
-            return SW_WRONG_LENGTH();
-        }
-        put_copy = calloc(1, apdu.nc + 10);
-        if (put_copy == NULL) {
-            return SW_EXEC_ERROR();
-        }
-        memcpy(put_copy, apdu.data, apdu.nc);
-        put_data = put_copy;
-        tlv_ctx_init(BYTE_ARRAY(put_data, put_len), &ctxi);
-        if (tlv_find_tag(&ctxi, TAG_IMF, &imf) == false) {
-            memcpy(put_data + put_len, "\x7a\x08\x00\x00\x00\x00\x00\x00\x00\x00", 10);
-            put_len += 10;
-        }
-        else { //prepend zero-valued bytes
-            if (imf.len < 8) {
-                size_t extra = 8 - imf.len;
-                size_t value_offset = (size_t)(imf.data - put_data);
-                memmove(put_data + value_offset + extra, put_data + value_offset, put_len - value_offset);
-                memset(put_data + value_offset, 0, extra);
-                *(imf.data - 1) = 8;
-                put_len += extra;
-            }
-        }
-    }
+
     uint16_t fid = 0;
     if (find_oath_cred(name.data, name.len, &fid)) {
-        int ret = oath_credential_write(fid, put_data, (uint16_t)put_len);
-        if (put_copy != NULL) {
-            mbedtls_platform_zeroize(put_copy, put_len);
-        }
+        int ret = oath_credential_write(fid, put_copy, (uint16_t)put_len);
+        mbedtls_platform_zeroize(put_copy, put_len);
         free(put_copy);
         if (ret != PICOKEYS_OK) {
             return SW_EXEC_ERROR();
@@ -697,10 +823,8 @@ static int cmd_put(void) {
         }
         for (int i = 0; i < MAX_OATH_CRED; i++) {
             if ((used[i / 8] & (1u << (i % 8))) == 0) {
-                int ret = oath_credential_write((uint16_t)(EF_OATH_CRED + i), put_data, (uint16_t)put_len);
-                if (put_copy != NULL) {
-                    mbedtls_platform_zeroize(put_copy, put_len);
-                }
+                int ret = oath_credential_write((uint16_t)(EF_OATH_CRED + i), put_copy, (uint16_t)put_len);
+                mbedtls_platform_zeroize(put_copy, put_len);
                 free(put_copy);
                 if (ret != PICOKEYS_OK) {
                     return SW_EXEC_ERROR();
@@ -708,9 +832,7 @@ static int cmd_put(void) {
                 return SW_OK();
             }
         }
-        if (put_copy != NULL) {
-            mbedtls_platform_zeroize(put_copy, put_len);
-        }
+        mbedtls_platform_zeroize(put_copy, put_len);
         free(put_copy);
         return SW_FILE_FULL();
     }
@@ -792,7 +914,11 @@ static int cmd_set_code(void) {
         return SW_DATA_INVALID();
     }
 
+#ifdef ENABLE_EMULATION
     validated = false;
+#else
+    validated = true;
+#endif
     file_t *ef_otp_pin = file_search_by_fid(EF_OTP_PIN, NULL, SPECIFY_EF);
     if (file_has_data(ef_otp_pin) && flash_clear_file(ef_otp_pin) != PICOKEYS_OK) {
         return SW_MEMORY_FAILURE();
@@ -1065,11 +1191,11 @@ static int cmd_calculate(void) {
         }
     }
 
-    if (tlv_find_tag(&ctxe, TAG_PROPERTY, &prop) == true && prop.len > 0 && (prop.data[0] & PROP_TOUCH) && !check_user_presence()) {
+    if (tlv_find_tag(&ctxe, TAG_PROPERTY, &prop) == true && prop.len > 0 && (prop.data[0] & PROP_TOUCH) && !oath_check_touch_presence()) {
         mbedtls_platform_zeroize(plain_key, plain_key_len);
         free(plain_key);
         oath_credential_close(&credential);
-        return SW_CONDITIONS_NOT_SATISFIED();
+        return SW_SECURITY_STATUS_NOT_SATISFIED();
     }
 
     if (!oath_response_has_room(1)) {
@@ -1457,7 +1583,7 @@ static int cmd_verify_hotp(void) {
         oath_credential_close(&credential);
         return SW_INCORRECT_PARAMS();
     }
-    if (tlv_find_tag(&ctxe, TAG_PROPERTY, &prop) == true && prop.len > 0 && (prop.data[0] & PROP_TOUCH) && !check_user_presence()) {
+    if (tlv_find_tag(&ctxe, TAG_PROPERTY, &prop) == true && prop.len > 0 && (prop.data[0] & PROP_TOUCH) && !oath_check_touch_presence()) {
         mbedtls_platform_zeroize(plain_key, plain_key_len);
         free(plain_key);
         oath_credential_close(&credential);
