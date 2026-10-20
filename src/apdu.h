@@ -73,6 +73,10 @@ extern uint16_t apdu_process(uint8_t itf, const_byte_array_t buffer);
 extern void apdu_finish(void);
 extern uint16_t apdu_next(void);
 extern uint16_t apdu_limit_response(uint16_t size_next, uint16_t max_size);
+/* The caller owns data until it is consumed or cleared. Responses are copied
+ * into the transport buffer in at most 256-byte GET RESPONSE chunks. */
+extern void apdu_set_response_buffer(const uint8_t *data, uint16_t len);
+extern void apdu_clear_response_buffer(void);
 extern void *apdu_thread(void *);
 extern int bulk_cmd(int (*cmd)(void));
 

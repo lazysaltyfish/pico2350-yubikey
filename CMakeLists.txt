@@ -302,6 +302,12 @@ if(ENABLE_EMULATION)
     target_link_libraries(piv_security_test PRIVATE mbedtls)
     add_test(NAME piv_security_test COMMAND piv_security_test)
 
+    add_executable(hsmauth_list_test tests/hsmauth_list_test.c)
+    target_include_directories(hsmauth_list_test PRIVATE ${INCLUDES} ${SYSTEM_INCLUDES})
+    target_compile_options(hsmauth_list_test PRIVATE -Wall -Wextra -Wshadow -Werror)
+    target_link_libraries(hsmauth_list_test PRIVATE mbedtls)
+    add_test(NAME hsmauth_list_test COMMAND hsmauth_list_test)
+
     add_executable(fido_oath_put_test tests/fido_oath_put_test.c src/fido/oath_put.c src/tlv.c)
     target_include_directories(fido_oath_put_test PRIVATE ${INCLUDES})
     target_compile_options(fido_oath_put_test PRIVATE -Wall -Wextra -Werror)

@@ -308,6 +308,7 @@ def run_host_unit_tests(repo_root: str) -> None:
                 "fido_client_pin_test",
                 "piv_security_test",
                 "fido_oath_put_test",
+                "hsmauth_list_test",
                 "fido_object_provider_test",
                 "fido_object_authorization_test",
                 "fido_resident_container_test",

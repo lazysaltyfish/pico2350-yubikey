@@ -67,6 +67,8 @@
 #define HSMAUTH_ALG_ECP256 39 /* 0x27 */
 
 #define HSMAUTH_MAX_CREDS       32
+#define HSMAUTH_MAX_LABEL_LEN   64
+#define HSMAUTH_LIST_ITEM_OVERHEAD 5
 #define HSMAUTH_INITIAL_RETRIES 8
 #define HSMAUTH_STATE_MAGIC     0x48534D41UL
 
@@ -93,6 +95,9 @@ typedef struct __attribute__((packed)) {
 static uint8_t ephem_priv[32];
 static uint8_t ephem_pub[65];
 static bool ephem_valid = false;
+/* LIST can exceed the USB transmit buffer. Keep its public metadata stable
+ * while the APDU layer copies bounded chunks for ISO GET RESPONSE. */
+static uint8_t hsmauth_list_response[HSMAUTH_MAX_CREDS * (HSMAUTH_MAX_LABEL_LEN + HSMAUTH_LIST_ITEM_OVERHEAD)];
 
 static int hsmauth_rng(void *ctx, unsigned char *buf, size_t len) {
     (void)ctx;
@@ -145,7 +150,7 @@ static bool hsmauth_load_cred(uint8_t idx, hsmauth_cred_t *cred) {
         return false;
     }
     memcpy(cred, file_get_data(ef), sizeof(*cred));
-    if (cred->magic != HSMAUTH_STATE_MAGIC) {
+    if (cred->magic != HSMAUTH_STATE_MAGIC || cred->label_len == 0 || cred->label_len > sizeof(cred->label)) {
         return false;
     }
     uint8_t mk[32];
@@ -342,18 +347,23 @@ static int cmd_hsmauth_list(void) {
     for (uint8_t i = 0; i < HSMAUTH_MAX_CREDS; i++) {
         hsmauth_cred_t c;
         if (hsmauth_load_cred(i, &c)) {
+            size_t size = HSMAUTH_LIST_ITEM_OVERHEAD + c.label_len;
+            if (size > sizeof(hsmauth_list_response) - off) {
+                mbedtls_platform_zeroize(&c, sizeof(c));
+                return SW_MEMORY_FAILURE();
+            }
             uint8_t item_len = (uint8_t)(3 + c.label_len);
-            res_APDU[off++] = HSMAUTH_TAG_LABEL_LIST;
-            res_APDU[off++] = item_len;
-            res_APDU[off++] = c.algo;
-            res_APDU[off++] = c.touch_required;
-            memcpy(res_APDU + off, c.label, c.label_len);
+            hsmauth_list_response[off++] = HSMAUTH_TAG_LABEL_LIST;
+            hsmauth_list_response[off++] = item_len;
+            hsmauth_list_response[off++] = c.algo;
+            hsmauth_list_response[off++] = c.touch_required;
+            memcpy(hsmauth_list_response + off, c.label, c.label_len);
             off += c.label_len;
-            res_APDU[off++] = c.retries;
+            hsmauth_list_response[off++] = c.retries;
             mbedtls_platform_zeroize(&c, sizeof(c));
         }
     }
-    res_APDU_size = (uint16_t)off;
+    apdu_set_response_buffer(hsmauth_list_response, (uint16_t)off);
     return SW_OK();
 }
 
@@ -736,6 +746,7 @@ static int cmd_hsmauth_reset(void) {
 }
 
 static int hsmauth_unload(void) {
+    apdu_clear_response_buffer();
     ephem_valid = false;
     return PICOKEYS_OK;
 }

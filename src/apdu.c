@@ -24,6 +24,10 @@
 uint8_t *rdata_gr = NULL;
 uint16_t rdata_bk = 0x0;
 static bool response_pending = false;
+static const uint8_t *response_buffer = NULL;
+static uint16_t response_buffer_len = 0;
+static app_t *response_buffer_app = NULL;
+static uint8_t response_buffer_cla = 0;
 extern uint32_t timeout;
 bool is_chaining = false;
 uint8_t chain_buf[2038];
@@ -31,6 +35,34 @@ uint8_t *chain_ptr = NULL;
 static uint8_t chain_header[4];
 
 struct apdu apdu;
+
+void apdu_clear_response_buffer(void) {
+    response_buffer = NULL;
+    response_buffer_len = 0;
+    response_buffer_app = NULL;
+}
+
+void apdu_set_response_buffer(const uint8_t *data, uint16_t len) {
+    response_buffer = data;
+    response_buffer_len = len;
+    response_buffer_app = current_app;
+    response_buffer_cla = CLA(apdu) & (uint8_t)~0x10;
+    res_APDU_size = 0;
+}
+
+static void apdu_copy_response_buffer(void) {
+    /* A short-APDU sized chunk also leaves room for every transport's header
+     * and status word, even if the caller requests an extended-length reply. */
+    if (apdu.ne == 0) apdu.ne = 256;
+    uint16_t chunk_limit = (uint16_t)MIN(apdu.ne, 256u);
+    uint16_t size = MIN(response_buffer_len, chunk_limit);
+    memcpy(apdu.rdata, response_buffer, size);
+    response_buffer += size;
+    response_buffer_len -= size;
+    apdu.rlen = size;
+    apdu.sw = response_buffer_len ? make_uint16_be(0x61, response_buffer_len >= 256 ? 0 : (uint8_t)response_buffer_len) : 0x9000;
+    if (!response_buffer_len) apdu_clear_response_buffer();
+}
 
 int process_apdu(void) {
     bool is_select = INS(apdu) == 0xA4 && P1(apdu) == 0x04 && (P2(apdu) == 0x00 || P2(apdu) == 0x04);
@@ -109,6 +141,7 @@ uint16_t apdu_process(uint8_t itf, const_byte_array_t buffer) {
     uint16_t buffer_size = 0;
 
     if (buffer.len < 4 || buffer.len > UINT16_MAX || buffer.data == NULL) {
+        apdu_clear_response_buffer();
         return 0;
     }
     buffer_size = (uint16_t)buffer.len;
@@ -140,6 +173,7 @@ uint16_t apdu_process(uint8_t itf, const_byte_array_t buffer) {
             apdu.data = apdu.header + 7;
             expected_size = apdu.nc + 7;
             if (buffer_size != expected_size && buffer_size != expected_size + 2) {
+                apdu_clear_response_buffer();
                 return 0;
             }
             if (buffer_size == expected_size + 2) {
@@ -156,6 +190,7 @@ uint16_t apdu_process(uint8_t itf, const_byte_array_t buffer) {
         apdu.ne = 0;
         expected_size = apdu.nc + 5;
         if (buffer_size != expected_size && buffer_size != expected_size + 1) {
+            apdu_clear_response_buffer();
             return 0;
         }
         if (buffer_size == expected_size + 1) {
@@ -166,6 +201,31 @@ uint16_t apdu_process(uint8_t itf, const_byte_array_t buffer) {
         }
     }
     //printf("apdu.nc %u, apdu.ne %u\n",apdu.nc,apdu.ne);
+    if (response_buffer && INS(apdu) == 0xC0) {
+        bool valid = current_app == response_buffer_app && CLA(apdu) == response_buffer_cla &&
+                     P1(apdu) == 0 && P2(apdu) == 0 && apdu.nc == 0;
+        if (valid) {
+            timeout_stop();
+            apdu.sw = 0x9000;
+            apdu_finish();
+            uint16_t size = apdu_next();
+#ifdef USB_ITF_HID
+            if (itf == ITF_HID_CTAP) {
+                driver_exec_finished_cont_hid(itf, size, 7);
+            }
+#endif
+#ifdef USB_ITF_CCID
+            if (itf == ITF_SC_CCID || itf == ITF_SC_WCID) {
+                driver_exec_finished_cont_ccid(itf, size, 0);
+            }
+#endif
+            return 0;
+        }
+        apdu_clear_response_buffer();
+    }
+    else if (INS(apdu) != 0xC0) {
+        apdu_clear_response_buffer();
+    }
     if (apdu.header[1] == 0xc0) {
         //printf("apdu.ne %u, apdu.rlen %d, bk %x\n",apdu.ne,apdu.rlen,rdata_bk);
         if (!response_pending || !rdata_gr) {
@@ -267,10 +327,15 @@ done:   ;
         current_app->unload();
         current_app = NULL;
     }
+    apdu_clear_response_buffer();
     return NULL;
 }
 
 void apdu_finish(void) {
+    if (response_buffer) {
+        if (apdu.sw == 0x9000) apdu_copy_response_buffer();
+        else apdu_clear_response_buffer();
+    }
     put_uint16_be(apdu.sw, apdu.rdata + apdu.rlen);
     // timeout_stop();
 }
