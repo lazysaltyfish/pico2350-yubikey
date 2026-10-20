@@ -87,7 +87,7 @@ configure_bool_option(
     "YubiHSM Auth Application: \t disabled"
 )
 
-option(ENABLE_SD_APP "Enable/disable Security Domain application" ON)
+option(ENABLE_SD_APP "Build unavailable Security Domain compatibility stub (SCP unsupported)" OFF)
 configure_bool_option(
     ENABLE_SD_APP
     ENABLE_SD_APP
@@ -329,6 +329,12 @@ if(ENABLE_EMULATION)
     target_include_directories(usb_arbitration_test PRIVATE ${INCLUDES})
     target_compile_options(usb_arbitration_test PRIVATE -Wall -Wextra -Wshadow -Werror -UNDEBUG)
     add_test(NAME usb_arbitration_test COMMAND usb_arbitration_test)
+
+    add_executable(securitydomain_security_test tests/securitydomain_security_test.c)
+    target_include_directories(securitydomain_security_test PRIVATE ${INCLUDES})
+    target_compile_options(securitydomain_security_test PRIVATE -Wall -Wextra -Wshadow -Werror -UNDEBUG)
+    target_link_libraries(securitydomain_security_test PRIVATE mbedtls)
+    add_test(NAME securitydomain_security_test COMMAND securitydomain_security_test)
 
     add_executable(fido_oath_put_test tests/fido_oath_put_test.c src/fido/oath_put.c src/tlv.c)
     target_include_directories(fido_oath_put_test PRIVATE ${INCLUDES})
