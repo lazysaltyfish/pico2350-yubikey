@@ -28,6 +28,7 @@
 #include "crypto_utils.h"
 #include "management.h"
 #include "oath_container.h"
+#include "oath_put.h"
 #include "mbedtls/constant_time.h"
 #include "mbedtls/gcm.h"
 #include "mbedtls/hkdf.h"
@@ -644,139 +645,6 @@ static bool find_oath_cred(const uint8_t *name, size_t name_len, uint16_t *fid) 
         }
     }
     return false;
-}
-
-static int oath_normalize_put_data(const uint8_t *in, size_t in_len, uint8_t **out_buf, size_t *out_len) {
-    if (!in || in_len == 0 || !out_buf || !out_len || in_len > UINT16_MAX - 16) {
-        return PICOKEYS_ERR_NULL_PARAM;
-    }
-    uint8_t *buf = (uint8_t *)calloc(1, in_len + 16);
-    if (!buf) {
-        return PICOKEYS_ERR_NO_MEMORY;
-    }
-    size_t rpos = 0;
-    size_t wpos = 0;
-    bool has_name = false;
-    bool has_key = false;
-    bool has_imf = false;
-    uint8_t key_type_alg = 0;
-
-    while (rpos < in_len) {
-        uint8_t tag = in[rpos];
-        size_t rem = in_len - rpos;
-        if (tag == TAG_PROPERTY) {
-            if (rem < 2) {
-                mbedtls_platform_zeroize(buf, in_len + 16);
-                free(buf);
-                return PICOKEYS_WRONG_DATA;
-            }
-            uint8_t prop_val = 0;
-            bool is_two_byte = false;
-            if (rem == 2) {
-                is_two_byte = true;
-            }
-            else if (in[rpos + 1] != 0x01) {
-                is_two_byte = true;
-            }
-            else if (rem >= 4 && in[rpos + 2] == TAG_IMF && (size_t)(2 + 2 + in[rpos + 3]) == rem) {
-                is_two_byte = true;
-            }
-            if (is_two_byte) {
-                prop_val = in[rpos + 1];
-                rpos += 2;
-            }
-            else {
-                prop_val = in[rpos + 2];
-                rpos += 3;
-            }
-            buf[wpos++] = TAG_PROPERTY;
-            buf[wpos++] = 1;
-            buf[wpos++] = prop_val;
-            continue;
-        }
-
-        uint8_t *p = (uint8_t *)(in + rpos);
-        tlv_ctx_t sub_ctx = { .data = p, .len = (uint16_t)rem };
-        tlv_item_t item;
-        uint8_t *walk_p = NULL;
-        if (!tlv_walk(&sub_ctx, &walk_p, &item)) {
-            mbedtls_platform_zeroize(buf, in_len + 16);
-            free(buf);
-            return PICOKEYS_WRONG_DATA;
-        }
-        size_t consumed = (size_t)(walk_p - p);
-        if (item.tag == TAG_NAME) {
-            if (item.value.len == 0) {
-                mbedtls_platform_zeroize(buf, in_len + 16);
-                free(buf);
-                return PICOKEYS_ERR_NULL_PARAM;
-            }
-            has_name = true;
-            memcpy(buf + wpos, p, consumed);
-            wpos += consumed;
-        }
-        else if (item.tag == TAG_KEY) {
-            if (item.value.len < 2) {
-                mbedtls_platform_zeroize(buf, in_len + 16);
-                free(buf);
-                return PICOKEYS_WRONG_DATA;
-            }
-            uint8_t oath_type = item.value.data[0] & OATH_TYPE_MASK;
-            uint8_t oath_alg = item.value.data[0] & ALG_MASK;
-            uint8_t digits = item.value.data[1];
-            if ((oath_type != OATH_TYPE_HOTP && oath_type != OATH_TYPE_TOTP) ||
-                (oath_alg != ALG_HMAC_SHA1 && oath_alg != ALG_HMAC_SHA256 && oath_alg != ALG_HMAC_SHA512) ||
-                (digits < 6 || digits > 8)) {
-                mbedtls_platform_zeroize(buf, in_len + 16);
-                free(buf);
-                return PICOKEYS_WRONG_DATA;
-            }
-            has_key = true;
-            key_type_alg = item.value.data[0];
-            memcpy(buf + wpos, p, consumed);
-            wpos += consumed;
-        }
-        else if (item.tag == TAG_IMF) {
-            if (item.value.len > 8) {
-                mbedtls_platform_zeroize(buf, in_len + 16);
-                free(buf);
-                return PICOKEYS_WRONG_DATA;
-            }
-            has_imf = true;
-            buf[wpos++] = TAG_IMF;
-            buf[wpos++] = 8;
-            size_t pad = 8 - item.value.len;
-            if (pad > 0) {
-                memset(buf + wpos, 0, pad);
-            }
-            if (item.value.len > 0) {
-                memcpy(buf + wpos + pad, item.value.data, item.value.len);
-            }
-            wpos += 8;
-        }
-        else {
-            memcpy(buf + wpos, p, consumed);
-            wpos += consumed;
-        }
-        rpos += consumed;
-    }
-
-    if (!has_name || !has_key) {
-        mbedtls_platform_zeroize(buf, in_len + 16);
-        free(buf);
-        return PICOKEYS_ERR_NULL_PARAM;
-    }
-
-    if ((key_type_alg & OATH_TYPE_MASK) == OATH_TYPE_HOTP && !has_imf) {
-        buf[wpos++] = TAG_IMF;
-        buf[wpos++] = 8;
-        memset(buf + wpos, 0, 8);
-        wpos += 8;
-    }
-
-    *out_buf = buf;
-    *out_len = wpos;
-    return PICOKEYS_OK;
 }
 
 static int cmd_put(void) {

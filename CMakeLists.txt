@@ -302,6 +302,12 @@ if(ENABLE_EMULATION)
     target_link_libraries(piv_security_test PRIVATE mbedtls)
     add_test(NAME piv_security_test COMMAND piv_security_test)
 
+    add_executable(fido_oath_put_test tests/fido_oath_put_test.c src/fido/oath_put.c src/tlv.c)
+    target_include_directories(fido_oath_put_test PRIVATE ${INCLUDES})
+    target_compile_options(fido_oath_put_test PRIVATE -Wall -Wextra -Werror)
+    target_link_libraries(fido_oath_put_test PRIVATE mbedtls)
+    add_test(NAME fido_oath_put_test COMMAND fido_oath_put_test)
+
     add_executable(fido_object_provider_test
         ${CMAKE_CURRENT_LIST_DIR}/src/fs/object_crypto_provider.c
         ${CMAKE_CURRENT_LIST_DIR}/src/fido/object_provider.c
@@ -486,6 +492,7 @@ else()
         list(APPEND SOURCES
             ${CMAKE_CURRENT_LIST_DIR}/src/fido/oath_container.c
             ${CMAKE_CURRENT_LIST_DIR}/src/fido/oath.c
+            ${CMAKE_CURRENT_LIST_DIR}/src/fido/oath_put.c
         )
     endif()
 
