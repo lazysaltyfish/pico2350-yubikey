@@ -96,6 +96,18 @@ int main(void) {
     assert(otp_hid_set_report_cb(1,0,HID_REPORT_TYPE_FEATURE,report,8)==1);
     otp_hid_task();assert(submitted==previous);
 
+    /* yubikit skips all-zero intermediate reports (seq 1..8) between seq 0 and seq 9. */
+    memset(report, 0, sizeof(report));
+    report[0]=0x55;
+    report[7]=0x80;
+    assert(otp_hid_set_report_cb(1,0,HID_REPORT_TYPE_FEATURE,report,8)==1);
+    memset(report, 0, sizeof(report));
+    report[1]=0x10;
+    put_uint16_le(crc(previous_frame,sizeof(previous_frame)),report+2);
+    report[7]=0x89;
+    assert(otp_hid_set_report_cb(1,0,HID_REPORT_TYPE_FEATURE,report,8)==1);
+    otp_hid_task();assert(submitted==previous+1);
+    finish();
     reply_size=68;
     submit();otp_hid_task();finish();
     for (unsigned seq=0;seq<10;seq++) {

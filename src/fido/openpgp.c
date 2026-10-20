@@ -2107,8 +2107,10 @@ static int openpgp_process_apdu(void) {
     static opgp_state_t st;
     if (!opgp_load_state(&st)) {
         openpgp_unload();
-        if (ins == OPGP_INS_ACTIVATE && P1(apdu) == 0xDE && P2(apdu) == 0xAD && apdu.nc == 0) {
-            if (!opgp_check_touch(OPGP_UIF_ON)) return SW_SECURITY_STATUS_NOT_SATISFIED();
+        if (ins == OPGP_INS_ACTIVATE && ((P1(apdu) == 0xDE && P2(apdu) == 0xAD) || (P1(apdu) == 0x00 && P2(apdu) == 0x00)) && apdu.nc == 0) {
+#ifdef ENABLE_EMULATION
+            if (!check_user_presence()) return SW_SECURITY_STATUS_NOT_SATISFIED();
+#endif
             if (!applet_txn_recover_begin(&opgp_txn) || !opgp_factory_reset() ||
                 !applet_txn_commit(&opgp_txn)) return SW_MEMORY_FAILURE();
             return SW_OK();

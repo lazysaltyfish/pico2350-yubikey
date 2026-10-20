@@ -107,7 +107,7 @@ void button_wait_start_timeout(uint32_t timeout_seconds) {
     signal_emit_param(SIGNAL_USER_PRESENCE_REQUEST, &data);
     cancel_button = false;
     async_button_wait = true;
-    async_button_pressed = picok_board_button_read();
+    async_button_pressed = button_hold_state;
     async_button_started = board_millis();
     async_button_timeout = button_timeout;
     async_button_led_mode = led_get_mode();
@@ -115,11 +115,12 @@ void button_wait_start_timeout(uint32_t timeout_seconds) {
     led_set_mode(MODE_BUTTON);
 }
 
+static bool last_locked_button_state = false;
 void button_wait_poll(void) {
     if (!async_button_wait) {
         return;
     }
-    bool pressed = picok_board_button_read();
+    bool pressed = last_locked_button_state;
     uint32_t now = board_millis();
     if (!async_button_pressed && pressed) {
         async_button_pressed = true;
@@ -178,6 +179,7 @@ void button_task(void) {
         }
         bool current_button_state = picok_board_button_read();
         multicore_lockout_end_timeout_us(1000);
+        last_locked_button_state = current_button_state;
         button_last_poll = now;
         if (async_button_wait) {
             button_wait_poll();

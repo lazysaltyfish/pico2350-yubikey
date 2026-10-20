@@ -43,13 +43,15 @@ int otp_hid_set_report_cb(uint8_t itf, uint8_t id, hid_report_type_t type, const
     if (seq >= 10) return 1;
     if (seq == 0) {
         memset(rx, 0, sizeof(rx));
-        rx_sequence = 0;
+        rx_sequence = 1;
     }
-    if (seq != rx_sequence) {
+    else if (rx_sequence == 0 || seq < rx_sequence) {
         rx_sequence = 0;
         return 1;
     }
-    rx_sequence++;
+    else {
+        rx_sequence = (uint8_t)(seq + 1);
+    }
     memcpy(rx + seq * 7, data, 7);
     if (seq == 9 && frame_crc(rx, 64) == get_uint16_le(rx + 65)) {
         memcpy(job, rx, sizeof(job));

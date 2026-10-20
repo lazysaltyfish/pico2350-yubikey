@@ -782,10 +782,6 @@ static int cmd_hsmauth_reset(void) {
     if (apdu.nc != 0) return SW_WRONG_LENGTH();
 #ifdef ENABLE_EMULATION
     if (!check_user_presence()) return SW_SECURITY_STATUS_NOT_SATISFIED();
-#else
-    uint32_t timeout_s = button_timeout_seconds();
-    if (timeout_s == 0) timeout_s = 15;
-    if (wait_button_pressed_timeout(timeout_s) != 0) return SW_SECURITY_STATUS_NOT_SATISFIED();
 #endif
     if (!applet_txn_recover_begin(&hsmauth_txn)) return SW_MEMORY_FAILURE();
     for (uint8_t i = 0; i < HSMAUTH_MAX_CREDS; i++) {
