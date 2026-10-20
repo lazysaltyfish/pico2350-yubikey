@@ -423,11 +423,37 @@ print("\nALL 8 YUBIKEY 5 APPLETS & 3 USB TRANSPORTS PASSED FULL HARDWARE VERIFIC
 
 ## 4. Host C Unit Tests (`ctest`)
 
-In addition to live hardware testing, the repository includes 8 host C unit test suites for storage containers, encryption providers, policy engines, and authorization state machines (`fido_object_provider_test`, `fido_object_authorization_test`, `fido_resident_container_test`, `fido_oath_container_test`, `fido_otp_container_test`, `object_store_test`, `object_crypto_provider_test`, `object_policy_test`):
+In addition to live hardware testing, the repository includes 12 host C test suites. Eight cover storage containers, encryption providers, policy engines, and authorization state machines (`fido_object_provider_test`, `fido_object_authorization_test`, `fido_resident_container_test`, `fido_oath_container_test`, `fido_otp_container_test`, `object_store_test`, `object_crypto_provider_test`, `object_policy_test`). Four exercise production command handlers or parsers with host fixtures:
+
+| Suite | Regression coverage |
+| --- | --- |
+| `piv_security_test` | Management authentication reflection, replay, malformed state transitions, touch policy, and valid 3DES/AES exchanges; F9 signing/ECDH and MOVE restrictions, ordinary key operations, and verified attestation certificate signatures. |
+| `fido_client_pin_test` | Protocol 1/2 ciphertext lengths and output capacities, rejection before retry changes, in-place decryption, and valid PIN token requests. |
+| `fido_oath_put_test` | Repeated-field overflow payloads, duplicate singleton fields, malformed TLVs, legacy Property/IMF compatibility, and maximum normalized lengths. |
+| `hsmauth_list_test` | Complete 32-credential lists, bounded GET RESPONSE chunks, short/extended Le, snapshot invalidation, malformed stored labels, and existing inline responses. |
 
 ```bash
 cmake -B build_emul -DENABLE_EMULATION=1 -DVIDPID=Yubikey -DENABLE_EDDSA=ON
 cmake --build build_emul -j8
 ctest --test-dir build_emul --output-on-failure
-rm -rf build_emul
 ```
+
+To run only these security regressions, use the same configured build and:
+
+```bash
+ctest --test-dir build_emul --output-on-failure \
+  -R '^(piv_security_test|fido_client_pin_test|fido_oath_put_test|hsmauth_list_test)$'
+```
+
+For AddressSanitizer and UndefinedBehaviorSanitizer checks with GCC or Clang:
+
+```bash
+cmake -B build_sanitizers -DENABLE_EMULATION=1 -DVIDPID=Yubikey -DENABLE_EDDSA=ON \
+  -DCMAKE_C_FLAGS='-fsanitize=address,undefined -fno-omit-frame-pointer -g' \
+  -DCMAKE_EXE_LINKER_FLAGS='-fsanitize=address,undefined'
+cmake --build build_sanitizers -j8
+ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=halt_on_error=1 \
+  ctest --test-dir build_sanitizers --output-on-failure
+```
+
+Leak detection is disabled above for compatibility with Apple's sanitizer runtime. The host fixtures replace persistent storage, hardware timing, user presence, and transport callbacks; they do not access a device. HSM LIST covers CCID/WCID dispatch and generic HID callback offsets, but does not establish HSM applet interoperability through the real HID router. Live hardware validation remains a separate layer.

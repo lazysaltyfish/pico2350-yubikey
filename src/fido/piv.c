@@ -1341,6 +1341,11 @@ static int cmd_piv_move_key(void) {
     }
     uint8_t to_slot = P1(apdu);
     uint8_t from_slot = P2(apdu);
+    /* The attestation key must not be relabeled as an ordinary signing key,
+     * nor may an ordinary generated key acquire the attestation role. */
+    if (from_slot == PIV_SLOT_ATTESTATION || to_slot == PIV_SLOT_ATTESTATION) {
+        return SW_INCORRECT_P1P2();
+    }
     int from_idx = piv_slot_index(from_slot);
     if (from_idx < 0) {
         return SW_INCORRECT_P1P2();
@@ -1577,6 +1582,11 @@ cleanup:
 static int cmd_piv_authenticate(void) {
     uint8_t alg = P1(apdu);
     uint8_t slot = P2(apdu);
+    /* F9 is only used internally by ATTEST, never for host-chosen signing
+     * or key agreement, even after PIN or management authentication. */
+    if (slot == PIV_SLOT_ATTESTATION) {
+        return SW_INCORRECT_P1P2();
+    }
     if (slot == PIV_SLOT_CARD_MGM) {
         return cmd_piv_authenticate_management(alg);
     }

@@ -360,10 +360,179 @@ static void test_invalid_attempts_consume_challenge(void) {
     assert_cleared();
 }
 
+static void management_login(void) {
+    uint8_t single[18] = { TAG_AUTH_RESPONSE, 16 };
+    unhex("3ad77bb40d7a3660a89ecaf32466ef97", single + 2);
+    assert(authenticate(PIV_ALG_AES128, start_single, sizeof(start_single)) == 0x9000);
+    assert(authenticate(PIV_ALG_AES128, single, sizeof(single)) == 0x9000);
+    assert(piv_mgm_authenticated);
+}
+
+static int generate_p256(uint8_t slot) {
+    const uint8_t data[] = {
+        0xAC, 9, TAG_GEN_ALGORITHM, 1, PIV_ALG_ECCP256,
+        TAG_PIN_POLICY, 1, PIV_PIN_POLICY_NEVER,
+        TAG_TOUCH_POLICY, 1, PIV_TOUCH_POLICY_NEVER,
+    };
+    return command(INS_GENERATE_ASYMMETRIC, 0, slot, data, sizeof(data));
+}
+
+static int private_operation(uint8_t slot, uint8_t alg, uint8_t tag,
+                              const uint8_t *input, size_t input_len) {
+    uint8_t data[1024], inner[1020];
+    uint8_t *ip = piv_append_tlv(inner, tag, input, input_len);
+    uint8_t *end = piv_append_tlv(data, TAG_DYN_AUTH, inner, (size_t)(ip - inner));
+    return command(INS_AUTHENTICATE, alg, slot, data, (size_t)(end - data));
+}
+
+static void assert_f9_private_operations_denied(void) {
+    uint8_t input[512] = { 1 };
+    const uint8_t algorithms[] = {
+        PIV_ALG_RSA1024, PIV_ALG_RSA2048, PIV_ALG_RSA3072, PIV_ALG_RSA4096,
+        PIV_ALG_ECCP256, PIV_ALG_ECCP384, PIV_ALG_ED25519, PIV_ALG_X25519,
+    };
+    for (size_t i = 0; i < sizeof(algorithms); i++) {
+        assert(private_operation(PIV_SLOT_ATTESTATION, algorithms[i],
+                                 TAG_AUTH_CHALLENGE, input, sizeof(input)) == 0x6A86);
+        assert(apdu.rlen == 0);
+        assert(private_operation(PIV_SLOT_ATTESTATION, algorithms[i],
+                                 TAG_AUTH_EXPONENTIATION, input, 65) == 0x6A86);
+        assert(apdu.rlen == 0);
+    }
+}
+
+static void test_attestation_role_isolation(void) {
+    configure(PIV_ALG_AES128, aes128_key, PIV_TOUCH_POLICY_NEVER);
+    uint16_t f9_fid = EF_PIV_KEY_BASE + piv_slot_index(PIV_SLOT_ATTESTATION);
+    /* Reject before loading F9, including before its lazy initialization. */
+    assert_f9_private_operations_denied();
+    assert(file_search(f9_fid) == NULL);
+    assert(generate_p256(PIV_SLOT_ATTESTATION) == 0x6982);
+    management_login();
+    assert(generate_p256(PIV_SLOT_AUTH) == 0x9000);
+    assert(command(INS_ATTEST, PIV_SLOT_AUTH, 0, NULL, 0) == 0x9000);
+
+    /* The dedicated ATTEST path still emits a certificate signed by F9. */
+    mbedtls_x509_crt leaf, issuer;
+    mbedtls_x509_crt_init(&leaf);
+    mbedtls_x509_crt_init(&issuer);
+    assert(mbedtls_x509_crt_parse_der(&leaf, response, apdu.rlen) == 0);
+    uint16_t cert_fid = EF_PIV_OBJ_BASE + piv_object_index(0x5FFF01u);
+    file_t *cert_file = file_search(cert_fid);
+    assert(file_has_data(cert_file));
+    tlv_ctx_t cert_object, cert_value;
+    tlv_ctx_init(BYTE_ARRAY(file_get_data(cert_file), file_get_size(cert_file)), &cert_object);
+    assert(tlv_find_tag(&cert_object, 0x70, &cert_value));
+    assert(mbedtls_x509_crt_parse_der(&issuer, cert_value.data, cert_value.len) == 0);
+    uint8_t cert_hash[64];
+    assert(mbedtls_md(mbedtls_md_info_from_type(leaf.sig_md), leaf.tbs.p,
+                      leaf.tbs.len, cert_hash) == 0);
+    assert(mbedtls_pk_verify(&issuer.pk, leaf.sig_md, cert_hash, 0,
+                             leaf.sig.p, leaf.sig.len) == 0);
+    assert(command(INS_ATTEST, PIV_SLOT_ATTESTATION, 0, NULL, 0) == 0x6A86);
+
+    /* Authentication must not grant access to the attestation signing key. */
+    uint8_t pin[8] = { '1', '2', '3', '4', '5', '6', 0xFF, 0xFF };
+    assert(command(INS_VERIFY, 0, PIV_PIN_P2, pin, sizeof(pin)) == 0x9000);
+    assert(piv_pin_verified && piv_mgm_authenticated);
+    assert_f9_private_operations_denied();
+
+    /* Ordinary slots continue signing with the public key just attested. */
+    uint8_t digest[32];
+    memset(digest, 0x63, sizeof(digest));
+    assert(private_operation(PIV_SLOT_AUTH, PIV_ALG_ECCP256,
+                             TAG_AUTH_CHALLENGE, digest, sizeof(digest)) == 0x9000);
+    tlv_ctx_t outer, dyn, signature;
+    tlv_ctx_init(BYTE_ARRAY(response, apdu.rlen), &outer);
+    assert(tlv_find_tag(&outer, TAG_DYN_AUTH, &dyn));
+    assert(tlv_find_tag(&dyn, TAG_AUTH_RESPONSE, &signature));
+    assert(mbedtls_pk_verify(&leaf.pk, MBEDTLS_MD_SHA256, digest, sizeof(digest),
+                             signature.data, signature.len) == 0);
+
+    /* Ordinary ECDH is likewise unaffected and agrees with the peer. */
+    mbedtls_ecp_keypair peer;
+    mbedtls_ecp_keypair_init(&peer);
+    assert(mbedtls_ecp_gen_key(MBEDTLS_ECP_DP_SECP256R1, &peer,
+                               random_fill_iterator, NULL) == 0);
+    uint8_t public_point[65], expected_secret[32];
+    size_t public_len;
+    assert(mbedtls_ecp_point_write_binary(&peer.grp, &peer.Q,
+                                          MBEDTLS_ECP_PF_UNCOMPRESSED,
+                                          &public_len, public_point, sizeof(public_point)) == 0);
+    assert(private_operation(PIV_SLOT_AUTH, PIV_ALG_ECCP256,
+                             TAG_AUTH_EXPONENTIATION, public_point, public_len) == 0x9000);
+    tlv_ctx_init(BYTE_ARRAY(response, apdu.rlen), &outer);
+    assert(tlv_find_tag(&outer, TAG_DYN_AUTH, &dyn));
+    assert(tlv_find_tag(&dyn, TAG_AUTH_RESPONSE, &signature));
+    mbedtls_mpi shared;
+    mbedtls_mpi_init(&shared);
+    assert(mbedtls_ecdh_compute_shared(&peer.grp, &shared,
+                                       &mbedtls_pk_ec(leaf.pk)->Q, &peer.d,
+                                       random_fill_iterator, NULL) == 0);
+    assert(mbedtls_mpi_write_binary(&shared, expected_secret, sizeof(expected_secret)) == 0);
+    assert(signature.len == sizeof(expected_secret));
+    assert(memcmp(signature.data, expected_secret, sizeof(expected_secret)) == 0);
+    mbedtls_mpi_free(&shared);
+    mbedtls_ecp_keypair_free(&peer);
+    mbedtls_x509_crt_free(&leaf);
+    mbedtls_x509_crt_free(&issuer);
+
+    /* Prevent relabeling an F9 private key into a usable signing slot, or
+     * promoting an ordinary generated key into an attestation issuer. */
+    file_t *f9 = file_search(f9_fid);
+    uint8_t f9_image[1024];
+    size_t f9_size = file_get_size(f9);
+    assert(f9_size <= sizeof(f9_image));
+    memcpy(f9_image, file_get_data(f9), f9_size);
+    assert(command(INS_MOVE_KEY, PIV_SLOT_RETIRED_FIRST, PIV_SLOT_ATTESTATION, NULL, 0) == 0x6A86);
+    assert(command(INS_MOVE_KEY, PIV_SLOT_ATTESTATION, PIV_SLOT_AUTH, NULL, 0) == 0x6A86);
+    assert(command(INS_MOVE_KEY, 0xFF, PIV_SLOT_ATTESTATION, NULL, 0) == 0x6A86);
+    assert(file_get_size(f9) == f9_size);
+    assert(memcmp(file_get_data(f9), f9_image, f9_size) == 0);
+    assert(command(INS_MOVE_KEY, PIV_SLOT_RETIRED_FIRST, PIV_SLOT_AUTH, NULL, 0) == 0x9000);
+    assert(command(INS_MOVE_KEY, PIV_SLOT_AUTH, PIV_SLOT_RETIRED_FIRST, NULL, 0) == 0x9000);
+
+    /* Importing a normal private key does not grant generated-key attestation. */
+    uint8_t imported[40] = { 0x06, 32 };
+    imported[33] = 1;
+    imported[34] = TAG_PIN_POLICY;
+    imported[35] = 1;
+    imported[36] = PIV_PIN_POLICY_NEVER;
+    imported[37] = TAG_TOUCH_POLICY;
+    imported[38] = 1;
+    imported[39] = PIV_TOUCH_POLICY_NEVER;
+    assert(command(INS_IMPORT_KEY, PIV_ALG_ECCP256, PIV_SLOT_CARD_AUTH,
+                    imported, sizeof(imported)) == 0x9000);
+    assert(command(INS_ATTEST, PIV_SLOT_CARD_AUTH, 0, NULL, 0) == 0x6985);
+
+    /* Explicit management provisioning of F9 remains available. The issuer
+     * certificate is separately provisioned by the administrator as before. */
+    assert(generate_p256(PIV_SLOT_ATTESTATION) == 0x9000);
+    assert(command(INS_IMPORT_KEY, PIV_ALG_ECCP256, PIV_SLOT_ATTESTATION,
+                    imported, sizeof(imported)) == 0x9000);
+    piv_key_header_t imported_header;
+    assert(piv_load_slot_key(PIV_SLOT_ATTESTATION, &imported_header, NULL, NULL) == PICOKEYS_OK);
+    assert(imported_header.origin == PIV_ORIGIN_IMPORTED);
+    assert_f9_private_operations_denied();
+    const uint8_t provision_cert[] = {
+        TAG_OBJ_ID, 3, 0x5F, 0xFF, 0x01,
+        TAG_OBJ_DATA, 9, 0x70, 2, 0x30, 0, 0x71, 1, 0, 0xFE, 0,
+    };
+    assert(command(INS_PUT_DATA, 0x3F, 0xFF, provision_cert, sizeof(provision_cert)) == 0x9000);
+    cert_file = file_search(cert_fid);
+    assert(file_get_size(cert_file) == sizeof(provision_cert) - 7);
+    assert(memcmp(file_get_data(cert_file), provision_cert + 7, sizeof(provision_cert) - 7) == 0);
+    piv_unload();
+    assert(command(INS_IMPORT_KEY, PIV_ALG_ECCP256, PIV_SLOT_ATTESTATION,
+                    imported, sizeof(imported)) == 0x6982);
+    assert(command(INS_PUT_DATA, 0x3F, 0xFF, provision_cert, sizeof(provision_cert)) == 0x6982);
+}
+
 int main(void) {
     test_valid_handshakes();
     test_mixing_and_touch();
     test_invalid_attempts_consume_challenge();
+    test_attestation_role_isolation();
     puts("PIV security regression tests passed");
     return 0;
 }
