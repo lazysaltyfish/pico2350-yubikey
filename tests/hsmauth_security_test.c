@@ -17,7 +17,7 @@ static bool rng_fail, touch_allowed;
 static bool ec_rng;
 static unsigned touch_requests;
 static file_t files[HSMAUTH_MAX_CREDS + 1];
-static uint8_t file_bytes[HSMAUTH_MAX_CREDS + 1][sizeof(hsmauth_cred_t)];
+static uint8_t file_bytes[HSMAUTH_MAX_CREDS + 1][sizeof(hsmauth_cred_t) + APPLET_STORAGE_OVERHEAD];
 static size_t file_sizes[HSMAUTH_MAX_CREDS + 1];
 
 uint16_t set_res_sw(uint8_t sw1, uint8_t sw2) {
@@ -32,6 +32,8 @@ int register_app(int (*select)(app_t *, uint8_t), const uint8_t *aid) {
 }
 void apdu_clear_response_buffer(void) {}
 void apdu_set_response_buffer(const uint8_t *data, uint16_t len) { (void)data; (void)len; }
+static const uint8_t test_otp_root[32] = { 0x42 };
+const uint8_t *otp_key_1 = test_otp_root;
 void derive_kbase(uint8_t key[32]) { memset(key, 0x42, 32); }
 int random_fill_buffer(byte_array_t out) {
     if (rng_fail) return PICOKEYS_EXEC_ERROR;
@@ -67,6 +69,11 @@ int file_put_data(file_t *f, const_byte_array_t bytes) {
     assert(bytes.len <= sizeof(file_bytes[0]));
     memcpy(f->data, bytes.data, bytes.len);
     file_sizes[f - files] = bytes.len;
+    return PICOKEYS_OK;
+}
+int file_read_at(const file_t *f, uint32_t offset, byte_array_t data) {
+    if (!f || offset > file_get_size(f) || data.len > file_get_size(f) - offset) return PICOKEYS_WRONG_LENGTH;
+    memcpy(data.data, f->data + offset, data.len);
     return PICOKEYS_OK;
 }
 int file_delete_no_commit(file_t *f) { file_sizes[f - files] = 0; return PICOKEYS_OK; }
@@ -133,6 +140,10 @@ static void reset_fixture(void) {
     hsmauth_unload();
     memset(files, 0, sizeof(files));
     memset(file_sizes, 0, sizeof(file_sizes));
+    rng_fail = false;
+    hsmauth_state_t initial_state;
+    hsmauth_default_state(&initial_state);
+    assert(hsmauth_save_state(&initial_state));
     rng_fail = ec_rng = false;
     touch_allowed = true;
     touch_requests = 0;
@@ -300,10 +311,72 @@ static void test_failure_and_lifecycle_consumption(void) {
     assert(touch_requests == 1);
 }
 
+static int reset_applet(void) {
+    memset(response, 0xA5, sizeof(response));
+    header[0] = 0; header[1] = HSMAUTH_INS_RESET; header[2] = 0xDE; header[3] = 0xAD;
+    apdu = (struct apdu){.header = header, .rdata = response};
+    return hsmauth_process_apdu();
+}
+
+static void test_authenticated_storage_and_recovery(void) {
+    reset_fixture();
+    hsmauth_state_t st;
+    assert(hsmauth_load_state(&st));
+    file_t *state_file = file_search(EF_HSMAUTH_STATE);
+    size_t state_len = file_get_size(state_file);
+    assert(state_len == sizeof(st) + APPLET_STORAGE_OVERHEAD);
+    assert(memcmp(state_file->data + APPLET_STORAGE_OVERHEAD, &st, sizeof(st)) != 0);
+    for (size_t i = 0; i < state_len; i++) {
+        state_file->data[i] ^= 1;
+        assert(!hsmauth_load_state(&st));
+        assert(command(HSMAUTH_INS_GET_VERSION, NULL, 0) == 0x6400);
+        state_file->data[i] ^= 1;
+    }
+    hsmauth_cred_t cred;
+    assert(hsmauth_load_cred(0, &cred));
+    file_t *cred_file = file_search(EF_HSMAUTH_CRED_BASE);
+    size_t cred_len = file_get_size(cred_file);
+    assert(cred_len == sizeof(cred) + APPLET_STORAGE_OVERHEAD);
+    for (size_t i = 0; i < cred_len; i++) {
+        cred_file->data[i] ^= 1;
+        memset(&cred, 0xA5, sizeof(cred));
+        assert(!hsmauth_load_cred(0, &cred));
+        const uint8_t *bytes = (const uint8_t *)&cred;
+        for (size_t j = 0; j < sizeof(cred); j++) assert(bytes[j] == 0);
+        cred_file->data[i] ^= 1;
+    }
+    /* Ciphertext cannot move between credential IDs, even with a valid tag. */
+    file_t *other = file_search(EF_HSMAUTH_CRED_BASE + 1);
+    assert(file_put_data(other, CONST_BYTE_ARRAY(cred_file->data, cred_len)) == PICOKEYS_OK);
+    assert(!hsmauth_load_cred(1, &cred));
+
+    /* Legacy plaintext security state is unverifiable; no automatic default
+     * or policy migration is allowed while any credential survives. */
+    hsmauth_default_state(&st);
+    st.mgm_key[0] = 0x77;
+    assert(file_put_data(state_file, CONST_BYTE_ARRAY((const uint8_t *)&st, sizeof(st))) == PICOKEYS_OK);
+    assert(command(HSMAUTH_INS_GET_MANAGEMENT_KEY_RETRIES, NULL, 0) == 0x6400);
+    touch_allowed = false;
+    assert(reset_applet() == 0x6982);
+    assert(file_has_data(cred_file));
+    touch_allowed = true;
+    assert(reset_applet() == 0x9000);
+    for (size_t i = 0; i < HSMAUTH_MAX_CREDS; i++) {
+        assert(!file_has_data(file_search((uint16_t)(EF_HSMAUTH_CRED_BASE + i))));
+    }
+    assert(hsmauth_load_state(&st));
+    assert(st.mgm_key[0] == 0 && st.mgm_retries == HSMAUTH_INITIAL_RETRIES);
+    /* Removing state alone cannot recreate default management access. */
+    assert(hsmauth_save_cred(0, &(hsmauth_cred_t){.algo=HSMAUTH_ALG_AES128, .label_len=1, .label={'a'}}));
+    file_delete_no_commit(state_file);
+    assert(command(HSMAUTH_INS_GET_VERSION, NULL, 0) == 0x6400);
+}
+
 int main(void) {
     test_symmetric_peer_proof();
     test_asymmetric_receipt_and_binding();
     test_failure_and_lifecycle_consumption();
+    test_authenticated_storage_and_recovery();
     puts("hsmauth_security_test: OK");
     return 0;
 }

@@ -23,6 +23,7 @@
 #include "picokeys.h"
 #include "apdu.h"
 #include "files.h"
+#include "applet_storage.h"
 #include "random.h"
 #include "serial.h"
 #include "crypto_utils.h"
@@ -198,18 +199,6 @@ static void opgp_sha256(const uint8_t *in, size_t in_len, uint8_t out[32]) {
     mbedtls_sha256(in, in_len, out, 0);
 }
 
-static void opgp_derive_master_key(uint8_t mk[32]) {
-    uint8_t kbase[32];
-    derive_kbase(kbase);
-    uint8_t seed[64];
-    memcpy(seed, kbase, 32);
-    static const char label[] = "PICO-FIDO-OPENPGP-MK-V1\x00\x00\x00\x00\x00\x00\x00\x00\x00";
-    memcpy(seed + 32, label, 32);
-    opgp_sha256(seed, sizeof(seed), mk);
-    mbedtls_platform_zeroize(kbase, sizeof(kbase));
-    mbedtls_platform_zeroize(seed, sizeof(seed));
-}
-
 static uint32_t opgp_get_serial_u32(void) {
     uint32_t b0 = (uint32_t)(pico_serial.id[0] & (uint8_t)~0xFCu);
     return (b0 << 24) | ((uint32_t)pico_serial.id[1] << 16) |
@@ -279,26 +268,31 @@ static void opgp_default_state(opgp_state_t *st) {
     st->kdf_len = 3;
 }
 
-static void opgp_save_state(const opgp_state_t *st) {
-    file_t *ef = file_search(EF_OPENPGP_STATE);
-    if (!ef) {
-        ef = file_new(EF_OPENPGP_STATE);
-    }
-    if (ef) {
-        file_put_data(ef, CONST_BYTE_ARRAY((const uint8_t *)st, sizeof(*st)));
-        flash_commit();
-    }
+static bool opgp_save_state(const opgp_state_t *st) {
+    return applet_storage_save(EF_OPENPGP_STATE, st, sizeof(*st));
 }
 
-static void opgp_load_state(opgp_state_t *st) {
+static bool opgp_load_state(opgp_state_t *st) {
     file_t *ef = file_search(EF_OPENPGP_STATE);
-    if (ef && file_has_data(ef) && file_get_size(ef) == sizeof(*st)) {
-        memcpy(st, file_get_data(ef), sizeof(*st));
-        if (st->magic == OPGP_STATE_MAGIC) {
-            return;
+    if (ef && file_has_data(ef)) {
+        if (!applet_storage_load(EF_OPENPGP_STATE, st, sizeof(*st)) || st->magic != OPGP_STATE_MAGIC) return false;
+        if (st->name_len > sizeof(st->name) || st->lang_len > sizeof(st->lang) ||
+            st->login_len > sizeof(st->login) || st->url_len > sizeof(st->url) ||
+            st->kdf_len > sizeof(st->kdf_data) || st->pw1_retries > st->pw1_max_retries ||
+            st->pw3_retries > st->pw3_max_retries || st->rc_retries > st->rc_max_retries) return false;
+        for (size_t i = 0; i < OPGP_NUM_SLOTS; i++) {
+            if (st->alg_attr_len[i] > sizeof(st->alg_attr[i]) || st->uif[i][0] > OPGP_UIF_CACHED_FIXED) return false;
         }
+        return true;
+    }
+    /* Defaults are safe only for a completely empty applet. */
+    for (uint16_t i = 0; i < OPGP_NUM_SLOTS; i++) {
+        if (file_has_data(file_search((uint16_t)(EF_OPENPGP_KEY_BASE + i))) ||
+            file_has_data(file_search((uint16_t)(EF_OPENPGP_CERT_BASE + i))) ||
+            file_has_data(file_search((uint16_t)(EF_OPENPGP_PRIV_DO_BASE + i)))) return false;
     }
     opgp_default_state(st);
+    return opgp_save_state(st);
 }
 
 static uint8_t opgp_kdf_alg(const opgp_state_t *st) {
@@ -412,108 +406,57 @@ static bool parse_tlv(const uint8_t *buf, size_t buf_len, size_t *pos, uint16_t 
     return true;
 }
 
-/* Key storage encryption/decryption in EF_OPENPGP_KEY_BASE + slot */
+/* Authenticate the complete key record, including public material and lengths,
+ * even when a caller requests only its header or public key. */
 static int opgp_store_key_record(uint8_t slot, uint8_t alg_id, uint8_t grp_id, uint16_t bits,
                                  const uint8_t *pub, uint16_t pub_len,
                                  const uint8_t *priv, uint16_t priv_len) {
-    if (slot >= OPGP_NUM_SLOTS || pub_len > 600 || priv_len > 1400) {
-        return -1;
-    }
-    uint8_t mk[32];
-    opgp_derive_master_key(mk);
-
-    static uint8_t buf[sizeof(opgp_key_hdr_t) + 600 + 1400];
-    opgp_key_hdr_t *hdr = (opgp_key_hdr_t *)buf;
-    hdr->alg_id = alg_id;
-    hdr->grp_id = grp_id;
-    hdr->bits = bits;
-    hdr->pub_len = pub_len;
-    hdr->priv_len = priv_len;
-    random_fill_buffer(BYTE_ARRAY(hdr->iv, sizeof(hdr->iv)));
-
-    memcpy(buf + sizeof(*hdr), pub, pub_len);
-
-    mbedtls_gcm_context gcm;
-    mbedtls_gcm_init(&gcm);
-    int r = mbedtls_gcm_setkey(&gcm, MBEDTLS_CIPHER_ID_AES, mk, 256);
-    if (r == 0) {
-        uint8_t aad[6] = { slot, alg_id, grp_id, (uint8_t)(bits >> 8), (uint8_t)(bits & 0xFF), 0x4F };
-        r = mbedtls_gcm_crypt_and_tag(&gcm, MBEDTLS_GCM_ENCRYPT, priv_len,
-                                      hdr->iv, sizeof(hdr->iv),
-                                      aad, sizeof(aad),
-                                      priv, buf + sizeof(*hdr) + pub_len,
-                                      sizeof(hdr->tag), hdr->tag);
-    }
-    mbedtls_gcm_free(&gcm);
-    mbedtls_platform_zeroize(mk, sizeof(mk));
-    if (r != 0) {
-        return -1;
-    }
-
-    uint16_t fid = (uint16_t)(EF_OPENPGP_KEY_BASE + slot);
-    file_t *ef = file_search(fid);
-    if (!ef) {
-        ef = file_new(fid);
-    }
-    if (!ef) {
-        return -1;
-    }
-    file_put_data(ef, CONST_BYTE_ARRAY(buf, (uint16_t)(sizeof(*hdr) + pub_len + priv_len)));
-    flash_commit();
-    return 0;
+    if (slot >= OPGP_NUM_SLOTS || pub_len > 600 || priv_len > 1400 ||
+        (!pub && pub_len) || (!priv && priv_len)) return -1;
+    static uint8_t record[sizeof(opgp_key_hdr_t) + 600 + 1400];
+    memset(record, 0, sizeof(record));
+    opgp_key_hdr_t hdr = { .alg_id = alg_id, .grp_id = grp_id, .bits = bits,
+                           .pub_len = pub_len, .priv_len = priv_len };
+    memcpy(record, &hdr, sizeof(hdr));
+    if (pub_len) memcpy(record + sizeof(hdr), pub, pub_len);
+    if (priv_len) memcpy(record + sizeof(hdr) + pub_len, priv, priv_len);
+    bool ok = applet_storage_save((uint16_t)(EF_OPENPGP_KEY_BASE + slot), record,
+                                  sizeof(hdr) + pub_len + priv_len);
+    mbedtls_platform_zeroize(record, sizeof(record));
+    return ok ? 0 : -1;
 }
 
 static int opgp_load_key_record(uint8_t slot, opgp_key_hdr_t *hdr_out,
                                 uint8_t *pub_out, uint16_t pub_max,
                                 uint8_t *priv_out, uint16_t priv_max) {
-    if (slot >= OPGP_NUM_SLOTS) {
-        return -1;
-    }
-    uint16_t fid = (uint16_t)(EF_OPENPGP_KEY_BASE + slot);
-    file_t *ef = file_search(fid);
-    if (!ef || !file_has_data(ef) || file_get_size(ef) < sizeof(opgp_key_hdr_t)) {
-        return -1;
-    }
-    const uint8_t *raw = file_get_data(ef);
-    uint16_t total = file_get_size(ef);
+    if (slot >= OPGP_NUM_SLOTS) return -1;
+    static uint8_t record[sizeof(opgp_key_hdr_t) + 600 + 1400];
+    size_t len;
+    if (!applet_storage_load_variable((uint16_t)(EF_OPENPGP_KEY_BASE + slot), record, sizeof(record), &len)) return -1;
     opgp_key_hdr_t hdr;
-    memcpy(&hdr, raw, sizeof(hdr));
-    if (sizeof(hdr) + hdr.pub_len + hdr.priv_len > total) {
-        return -1;
-    }
-    if (pub_out && hdr.pub_len > pub_max) {
-        return -1;
-    }
-    if (priv_out && hdr.priv_len > priv_max) {
-        return -1;
-    }
-    if (pub_out) {
-        memcpy(pub_out, raw + sizeof(hdr), hdr.pub_len);
-    }
-    if (priv_out) {
-        uint8_t mk[32];
-        opgp_derive_master_key(mk);
-        mbedtls_gcm_context gcm;
-        mbedtls_gcm_init(&gcm);
-        int r = mbedtls_gcm_setkey(&gcm, MBEDTLS_CIPHER_ID_AES, mk, 256);
-        if (r == 0) {
-            uint8_t aad[6] = { slot, hdr.alg_id, hdr.grp_id, (uint8_t)(hdr.bits >> 8), (uint8_t)(hdr.bits & 0xFF), 0x4F };
-            r = mbedtls_gcm_auth_decrypt(&gcm, hdr.priv_len,
-                                         hdr.iv, sizeof(hdr.iv),
-                                         aad, sizeof(aad),
-                                         hdr.tag, sizeof(hdr.tag),
-                                         raw + sizeof(hdr) + hdr.pub_len, priv_out);
-        }
-        mbedtls_gcm_free(&gcm);
-        mbedtls_platform_zeroize(mk, sizeof(mk));
-        if (r != 0) {
-            return -1;
-        }
-    }
-    if (hdr_out) {
-        *hdr_out = hdr;
-    }
-    return 0;
+    int ret = -1;
+    if (len < sizeof(hdr)) goto done;
+    memcpy(&hdr, record, sizeof(hdr));
+    if (hdr.pub_len > 600 || hdr.priv_len > 1400 ||
+        sizeof(hdr) + hdr.pub_len + hdr.priv_len != len ||
+        (pub_out && hdr.pub_len > pub_max) || (priv_out && hdr.priv_len > priv_max)) goto done;
+    if (pub_out) memcpy(pub_out, record + sizeof(hdr), hdr.pub_len);
+    if (priv_out) memcpy(priv_out, record + sizeof(hdr) + hdr.pub_len, hdr.priv_len);
+    if (hdr_out) *hdr_out = hdr;
+    ret = 0;
+done:
+    mbedtls_platform_zeroize(record, sizeof(record));
+    return ret;
+}
+
+static int opgp_get_stored_data(uint16_t fid, size_t limit) {
+    static uint8_t data[2048];
+    file_t *ef = file_search(fid);
+    if (!ef || !file_has_data(ef)) return SW_OK();
+    size_t len;
+    if (limit > sizeof(data) || !applet_storage_load_variable(fid, data, limit, &len)) return SW_EXEC_ERROR();
+    apdu_set_response_buffer(data, (uint16_t)len);
+    return SW_OK();
 }
 
 static void opgp_delete_slot_key(opgp_state_t *st, uint8_t slot) {
@@ -533,28 +476,29 @@ static void opgp_delete_slot_key(opgp_state_t *st, uint8_t slot) {
     }
 }
 
-static void opgp_factory_reset(void) {
+static bool opgp_factory_reset(void) {
     for (uint8_t s = 0; s < OPGP_NUM_SLOTS; s++) {
         file_t *ef = file_search((uint16_t)(EF_OPENPGP_KEY_BASE + s));
         if (ef && file_has_data(ef)) {
-            file_delete_no_commit(ef);
+            if (file_delete_no_commit(ef) != PICOKEYS_OK) return false;
         }
         ef = file_search((uint16_t)(EF_OPENPGP_CERT_BASE + s));
         if (ef && file_has_data(ef)) {
-            file_delete_no_commit(ef);
+            if (file_delete_no_commit(ef) != PICOKEYS_OK) return false;
         }
         ef = file_search((uint16_t)(EF_OPENPGP_PRIV_DO_BASE + s));
         if (ef && file_has_data(ef)) {
-            file_delete_no_commit(ef);
+            if (file_delete_no_commit(ef) != PICOKEYS_OK) return false;
         }
     }
     static opgp_state_t st;
     opgp_default_state(&st);
-    opgp_save_state(&st);
+    if (!opgp_save_state(&st)) return false;
     pw1_81_verified = false;
     pw1_82_verified = false;
     pw3_verified = false;
     selected_cert_occurrence = 0;
+    return true;
 }
 
 static bool opgp_validate_alg_attr(uint8_t slot, const uint8_t *attr, size_t len) {
@@ -725,7 +669,7 @@ static int cmd_opgp_select_data(void) {
 
 static int cmd_opgp_get_data(void) {
     static opgp_state_t st;
-    opgp_load_state(&st);
+    if (!opgp_load_state(&st)) return SW_EXEC_ERROR();
     uint16_t tag = (uint16_t)((P1(apdu) << 8) | P2(apdu));
 
     switch (tag) {
@@ -876,13 +820,7 @@ static int cmd_opgp_get_data(void) {
                 else if (selected_cert_occurrence == 2) cert_idx = OPGP_SLOT_SIG;
                 else cert_idx = OPGP_SLOT_ATT;
             }
-            file_t *ef = file_search((uint16_t)(EF_OPENPGP_CERT_BASE + cert_idx));
-            if (ef && file_has_data(ef)) {
-                uint16_t sz = file_get_size(ef);
-                memcpy(res_APDU, file_get_data(ef), sz);
-                res_APDU_size = sz;
-            }
-            return SW_OK();
+            return opgp_get_stored_data((uint16_t)(EF_OPENPGP_CERT_BASE + cert_idx), 2048);
         }
         case 0x0101:
         case 0x0102:
@@ -895,13 +833,7 @@ static int cmd_opgp_get_data(void) {
                 return SW_SECURITY_STATUS_NOT_SATISFIED();
             }
             uint8_t idx = (uint8_t)(tag - 0x0101);
-            file_t *ef = file_search((uint16_t)(EF_OPENPGP_PRIV_DO_BASE + idx));
-            if (ef && file_has_data(ef)) {
-                uint16_t sz = file_get_size(ef);
-                memcpy(res_APDU, file_get_data(ef), sz);
-                res_APDU_size = sz;
-            }
-            return SW_OK();
+            return opgp_get_stored_data((uint16_t)(EF_OPENPGP_PRIV_DO_BASE + idx), 255);
         }
         default:
             return SW_REFERENCE_NOT_FOUND();
@@ -910,7 +842,7 @@ static int cmd_opgp_get_data(void) {
 
 static int cmd_opgp_put_data(void) {
     static opgp_state_t st;
-    opgp_load_state(&st);
+    if (!opgp_load_state(&st)) return SW_EXEC_ERROR();
     uint16_t tag = (uint16_t)((P1(apdu) << 8) | P2(apdu));
 
     /* Check access control: 0x0101 and 0x0103 require PW1(82), all others require PW3 */
@@ -1110,10 +1042,7 @@ static int cmd_opgp_put_data(void) {
                 }
             }
             else {
-                if (!ef) ef = file_new(fid);
-                if (!ef) return SW_MEMORY_FAILURE();
-                file_put_data(ef, CONST_BYTE_ARRAY(apdu.data, (uint16_t)apdu.nc));
-                flash_commit();
+                if (!applet_storage_save(fid, apdu.data, apdu.nc)) return SW_MEMORY_FAILURE();
             }
             return SW_OK();
         }
@@ -1132,10 +1061,7 @@ static int cmd_opgp_put_data(void) {
                 }
             }
             else {
-                if (!ef) ef = file_new(fid);
-                if (!ef) return SW_MEMORY_FAILURE();
-                file_put_data(ef, CONST_BYTE_ARRAY(apdu.data, (uint16_t)apdu.nc));
-                flash_commit();
+                if (!applet_storage_save(fid, apdu.data, apdu.nc)) return SW_MEMORY_FAILURE();
             }
             return SW_OK();
         }
@@ -1146,7 +1072,7 @@ static int cmd_opgp_put_data(void) {
 
 static int cmd_opgp_verify(void) {
     static opgp_state_t st;
-    opgp_load_state(&st);
+    if (!opgp_load_state(&st)) return SW_EXEC_ERROR();
     uint8_t p1 = P1(apdu);
     uint8_t p2 = P2(apdu);
 
@@ -1213,7 +1139,7 @@ static int cmd_opgp_verify(void) {
 
 static int cmd_opgp_change_pin(void) {
     static opgp_state_t st;
-    opgp_load_state(&st);
+    if (!opgp_load_state(&st)) return SW_EXEC_ERROR();
     uint8_t p1 = P1(apdu);
     uint8_t p2 = P2(apdu);
     if (p1 != 0x00 || (p2 != 0x81 && p2 != 0x83)) {
@@ -1262,7 +1188,7 @@ static int cmd_opgp_change_pin(void) {
 
 static int cmd_opgp_reset_retry_counter(void) {
     static opgp_state_t st;
-    opgp_load_state(&st);
+    if (!opgp_load_state(&st)) return SW_EXEC_ERROR();
     uint8_t p1 = P1(apdu);
     uint8_t p2 = P2(apdu);
     if (p2 != 0x81 || (p1 != 0x00 && p1 != 0x02)) {
@@ -1319,7 +1245,7 @@ static int cmd_opgp_set_pin_retries(void) {
         return SW_WRONG_DATA();
     }
     static opgp_state_t st;
-    opgp_load_state(&st);
+    if (!opgp_load_state(&st)) return SW_EXEC_ERROR();
     st.pw1_max_retries = apdu.data[0];
     st.pw1_retries = apdu.data[0];
     st.rc_max_retries = apdu.data[1];
@@ -1462,16 +1388,16 @@ static int opgp_generate_slot_key(opgp_state_t *st, uint8_t slot, opgp_key_hdr_t
     return 0;
 }
 
-static void opgp_ensure_att_key(opgp_state_t *st) {
+static bool opgp_ensure_att_key(opgp_state_t *st) {
     opgp_key_hdr_t hdr;
-    if (opgp_load_key_record(OPGP_SLOT_ATT, &hdr, NULL, 0, NULL, 0) == 0) {
-        return;
+    if (file_has_data(file_search(EF_OPENPGP_KEY_BASE + OPGP_SLOT_ATT))) {
+        return opgp_load_key_record(OPGP_SLOT_ATT, &hdr, NULL, 0, NULL, 0) == 0;
     }
     /* Provision default P-256 Attestation Key (fast & compact) */
     static const uint8_t att_p256_attr[9] = { 0x13, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07 };
     memcpy(st->alg_attr[OPGP_SLOT_ATT], att_p256_attr, sizeof(att_p256_attr));
     st->alg_attr_len[OPGP_SLOT_ATT] = sizeof(att_p256_attr);
-    opgp_generate_slot_key(st, OPGP_SLOT_ATT, NULL, NULL);
+    return opgp_generate_slot_key(st, OPGP_SLOT_ATT, NULL, NULL) == 0;
 }
 
 static int cmd_opgp_generate_asym(void) {
@@ -1486,7 +1412,7 @@ static int cmd_opgp_generate_asym(void) {
     }
 
     static opgp_state_t st;
-    opgp_load_state(&st);
+    if (!opgp_load_state(&st)) return SW_EXEC_ERROR();
 
     if (p1 == 0x80) {
         if (!pw3_verified) {
@@ -1502,7 +1428,7 @@ static int cmd_opgp_generate_asym(void) {
     }
     else {
         if (slot == OPGP_SLOT_ATT) {
-            opgp_ensure_att_key(&st);
+            if (!opgp_ensure_att_key(&st)) return SW_EXEC_ERROR();
         }
         opgp_key_hdr_t hdr;
         static uint8_t pub[600];
@@ -1592,7 +1518,7 @@ static int cmd_opgp_put_data_odd(void) {
     (void)len_91;
 
     static opgp_state_t st;
-    opgp_load_state(&st);
+    if (!opgp_load_state(&st)) return SW_EXEC_ERROR();
     const uint8_t *attr = st.alg_attr[slot];
     size_t attr_len = st.alg_attr_len[slot];
     uint8_t alg_id = attr[0];
@@ -1775,7 +1701,7 @@ static int opgp_sign_with_slot(opgp_state_t *st, uint8_t slot) {
 static int cmd_opgp_pso(void) {
     uint16_t p1p2 = (uint16_t)((P1(apdu) << 8) | P2(apdu));
     static opgp_state_t st;
-    opgp_load_state(&st);
+    if (!opgp_load_state(&st)) return SW_EXEC_ERROR();
 
     if (p1p2 == 0x9E9A) {
         /* Compute Digital Signature */
@@ -1901,7 +1827,7 @@ static int cmd_opgp_internal_authenticate(void) {
         return SW_SECURITY_STATUS_NOT_SATISFIED();
     }
     static opgp_state_t st;
-    opgp_load_state(&st);
+    if (!opgp_load_state(&st)) return SW_EXEC_ERROR();
     return opgp_sign_with_slot(&st, OPGP_SLOT_AUT);
 }
 
@@ -1931,7 +1857,7 @@ static int cmd_opgp_terminate(void) {
         return SW_INCORRECT_P1P2();
     }
     static opgp_state_t st;
-    opgp_load_state(&st);
+    if (!opgp_load_state(&st)) return SW_EXEC_ERROR();
     if (!pw3_verified && !(st.pw1_retries == 0 && st.pw3_retries == 0)) {
         return SW_SECURITY_STATUS_NOT_SATISFIED();
     }
@@ -1945,9 +1871,9 @@ static int cmd_opgp_activate(void) {
         return SW_INCORRECT_P1P2();
     }
     static opgp_state_t st;
-    opgp_load_state(&st);
+    if (!opgp_load_state(&st)) return SW_EXEC_ERROR();
     if (st.terminated) {
-        opgp_factory_reset();
+        if (!opgp_factory_reset()) return SW_MEMORY_FAILURE();
     }
     return SW_OK();
 }
@@ -1967,11 +1893,11 @@ static int cmd_opgp_get_attestation(void) {
     }
     uint8_t slot = (uint8_t)(key_ref - 1);
     static opgp_state_t st;
-    opgp_load_state(&st);
+    if (!opgp_load_state(&st)) return SW_EXEC_ERROR();
     if (!opgp_check_touch(st.uif[OPGP_SLOT_ATT][0])) {
         return SW_SECURITY_STATUS_NOT_SATISFIED();
     }
-    opgp_ensure_att_key(&st);
+    if (!opgp_ensure_att_key(&st)) return SW_EXEC_ERROR();
 
     opgp_key_hdr_t subj_hdr, att_hdr;
     static uint8_t subj_pub[600], att_pub[600], att_priv[1400];
@@ -2089,17 +2015,13 @@ static int cmd_opgp_get_attestation(void) {
 
     /* Store into certificate slot for key_ref */
     uint16_t fid = (uint16_t)(EF_OPENPGP_CERT_BASE + slot);
-    file_t *ef = file_search(fid);
-    if (!ef) ef = file_new(fid);
-    if (ef) {
-        file_put_data(ef, CONST_BYTE_ARRAY(res_APDU, (uint16_t)cert_len));
-        flash_commit();
-    }
+    if (!applet_storage_save(fid, res_APDU, cert_len)) return SW_MEMORY_FAILURE();
     res_APDU_size = (uint16_t)cert_len;
     return SW_OK();
 }
 
 static int openpgp_unload(void) {
+    apdu_clear_response_buffer();
     pw1_81_verified = false;
     pw1_82_verified = false;
     pw3_verified = false;
@@ -2113,7 +2035,17 @@ static int openpgp_process_apdu(void) {
     }
     uint8_t ins = INS(apdu);
     static opgp_state_t st;
-    opgp_load_state(&st);
+    if (!opgp_load_state(&st)) {
+        openpgp_unload();
+        /* Explicit recovery destroys all applet material. Unauthenticated
+         * legacy policies cannot safely be inferred or migrated in place. */
+        if (ins == OPGP_INS_ACTIVATE && P1(apdu) == 0xDE && P2(apdu) == 0xAD && apdu.nc == 0) {
+            if (!opgp_check_touch(OPGP_UIF_ON)) return SW_SECURITY_STATUS_NOT_SATISFIED();
+            if (!opgp_factory_reset()) return SW_MEMORY_FAILURE();
+            return opgp_load_state(&st) ? SW_OK() : SW_EXEC_ERROR();
+        }
+        return SW_EXEC_ERROR();
+    }
     if (st.terminated && ins != OPGP_INS_ACTIVATE && ins != OPGP_INS_GET_DATA && ins != OPGP_INS_GET_VERSION) {
         return SW_CONDITIONS_NOT_SATISFIED();
     }

@@ -31,7 +31,7 @@ uint8_t ITF_SC_CCID = 0, ITF_SC_WCID = 1;
 uint8_t ITF_HID_CTAP = 2;
 
 static file_t test_files[HSMAUTH_MAX_CREDS + 1];
-static uint8_t file_bytes[HSMAUTH_MAX_CREDS + 1][sizeof(hsmauth_cred_t)];
+static uint8_t file_bytes[HSMAUTH_MAX_CREDS + 1][sizeof(hsmauth_cred_t) + APPLET_STORAGE_OVERHEAD];
 static size_t file_sizes[HSMAUTH_MAX_CREDS + 1];
 static struct {
     uint8_t before[16];
@@ -58,6 +58,8 @@ int select_app(const_byte_array_t aid) {
 }
 
 bool cap_supported(uint16_t cap) { return cap == CAP_HSMAUTH; }
+static const uint8_t test_otp_root[32] = { 0x42 };
+const uint8_t *otp_key_1 = test_otp_root;
 void derive_kbase(uint8_t out[32]) { memset(out, 0x42, 32); }
 int random_fill_buffer(byte_array_t out) {
     memset(out.data, 0x24, out.len);
@@ -93,12 +95,17 @@ file_t *file_new(uint16_t fid) {
 }
 
 uint32_t file_get_size(const file_t *f) { return (uint32_t)file_sizes[f - test_files]; }
-bool file_has_data(const file_t *f) { return file_get_size(f) != 0; }
+bool file_has_data(const file_t *f) { return f && file_get_size(f) != 0; }
 uint8_t *file_get_data(const file_t *f) { return f->data; }
 int file_put_data(file_t *f, const_byte_array_t data) {
     assert(data.len <= sizeof(file_bytes[0]));
     memcpy(f->data, data.data, data.len);
     file_sizes[f - test_files] = data.len;
+    return PICOKEYS_OK;
+}
+int file_read_at(const file_t *f, uint32_t offset, byte_array_t data) {
+    if (!f || offset > file_get_size(f) || data.len > file_get_size(f) - offset) return PICOKEYS_WRONG_LENGTH;
+    memcpy(data.data, f->data + offset, data.len);
     return PICOKEYS_OK;
 }
 int file_delete_no_commit(file_t *f) { file_sizes[f - test_files] = 0; return PICOKEYS_OK; }
@@ -157,6 +164,9 @@ static void reset_fixture(void) {
     response_pending = false;
     memset(test_files, 0, sizeof(test_files));
     memset(file_sizes, 0, sizeof(file_sizes));
+    hsmauth_state_t initial_state;
+    hsmauth_default_state(&initial_state);
+    assert(hsmauth_save_state(&initial_state));
     current_app = &apps[0];
     current_app->process_apdu = hsmauth_process_apdu;
     current_app->unload = hsmauth_unload;
@@ -259,7 +269,9 @@ static void test_pending_response_invalidation(void) {
 
     /* The pending bytes are a stable snapshot, even if storage changes. */
     assert(exchange(list, sizeof(list)) == 0x6100);
-    memset(file_sizes, 0, sizeof(file_sizes));
+    for (size_t i = 0; i < sizeof(test_files) / sizeof(test_files[0]); i++) {
+        if (test_files[i].fid != EF_HSMAUTH_STATE) file_sizes[i] = 0;
+    }
     assert(exchange(next, sizeof(next)) == 0x6100);
     assert(memcmp(res_APDU, expected + 1, tx_len - 2) == 0);
     assert(exchange(list, sizeof(list)) == 0x9000);
@@ -300,11 +312,14 @@ static void test_invalid_stored_labels(void) {
     const uint8_t list[] = {0, HSMAUTH_INS_LIST, 0, 0, 0};
     reset_fixture();
     seed_credentials(1, 64, expected);
-    hsmauth_cred_t *stored = (hsmauth_cred_t *)file_get_data(file_search(EF_HSMAUTH_CRED_BASE));
-    stored->label_len = 65;
+    hsmauth_cred_t invalid;
+    assert(hsmauth_load_cred(0, &invalid));
+    invalid.label_len = 65;
+    assert(applet_storage_save(EF_HSMAUTH_CRED_BASE, &invalid, sizeof(invalid)));
     assert(exchange(list, sizeof(list)) == 0x9000);
     assert(tx_len == 2);
-    stored->label_len = 0;
+    invalid.label_len = 0;
+    assert(applet_storage_save(EF_HSMAUTH_CRED_BASE, &invalid, sizeof(invalid)));
     assert(exchange(list, sizeof(list)) == 0x9000);
     assert(tx_len == 2);
 }
