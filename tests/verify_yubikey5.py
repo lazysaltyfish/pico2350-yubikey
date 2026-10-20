@@ -305,6 +305,7 @@ def run_host_unit_tests(repo_root: str) -> None:
         subprocess.run(
             [
                 "cmake", "--build", build_dir, "--target",
+                "fido_client_pin_test",
                 "piv_security_test",
                 "fido_object_provider_test",
                 "fido_object_authorization_test",

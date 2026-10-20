@@ -267,17 +267,36 @@ int encrypt(uint8_t protocol, const uint8_t *key, const uint8_t *in, uint16_t in
     return -1;
 }
 
-int decrypt(uint8_t protocol, const uint8_t *key, const uint8_t *in, uint16_t in_len, uint8_t *out) {
-    if (protocol == 1) {
-        memcpy(out, in, in_len);
-        return aes_decrypt(CONST_BYTE_ARRAY(key, 32), NULL, PICOKEYS_AES_MODE_CBC, BYTE_ARRAY(out, in_len));
+int decrypt(uint8_t protocol, const uint8_t *key, const uint8_t *in, size_t in_len, uint8_t *out, size_t out_capacity) {
+    if (protocol != 1 && protocol != 2) {
+        return PICOKEYS_WRONG_DATA;
     }
-    else if (protocol == 2) {
-        memcpy(out, in + IV_SIZE, in_len - IV_SIZE);
-        return aes_decrypt(CONST_BYTE_ARRAY(key + 32, 32), in, PICOKEYS_AES_MODE_CBC, BYTE_ARRAY(out, in_len - IV_SIZE));
+    if (!key || !in || !out) {
+        return PICOKEYS_ERR_NULL_PARAM;
+    }
+    size_t iv_len = protocol == 2 ? IV_SIZE : 0;
+    if (in_len <= iv_len) {
+        return PICOKEYS_WRONG_LENGTH;
+    }
+    size_t plain_len = in_len - iv_len;
+    if (plain_len % IV_SIZE != 0 || plain_len > out_capacity) {
+        return PICOKEYS_WRONG_LENGTH;
     }
 
-    return -1;
+    // Validate the entire operation before copying any host-controlled bytes.
+    uint8_t iv[IV_SIZE] = { 0 };
+    if (protocol == 2) {
+        memcpy(iv, in, sizeof(iv));
+    }
+    memmove(out, in + iv_len, plain_len);
+    int ret = aes_decrypt(CONST_BYTE_ARRAY(key + (protocol == 2 ? 32 : 0), 32),
+                          protocol == 2 ? iv : NULL, PICOKEYS_AES_MODE_CBC,
+                          BYTE_ARRAY(out, plain_len));
+    mbedtls_platform_zeroize(iv, sizeof(iv));
+    if (ret != 0) {
+        mbedtls_platform_zeroize(out, plain_len);
+    }
+    return ret;
 }
 
 int verify(uint8_t protocol, const uint8_t *key, const uint8_t *data, uint16_t len, uint8_t *sign) {
@@ -465,6 +484,17 @@ int cbor_client_pin(const uint8_t *data, size_t len) {
         CBOR_ERROR(CTAP1_ERR_INVALID_PARAMETER);
     }
 
+    // Reject malformed ciphertexts before key agreement or PIN retry updates.
+    size_t protocol_iv_len = pinUvAuthProtocol == 2 ? IV_SIZE : 0;
+    if ((subcommand == 0x4 || subcommand == 0x5 || subcommand == 0x9) &&
+        pinHashEnc.present && pinHashEnc.len != 16u + protocol_iv_len) {
+        CBOR_ERROR(CTAP1_ERR_INVALID_PARAMETER);
+    }
+    if ((subcommand == 0x3 || subcommand == 0x4) && pinUvAuthParam.present &&
+        pinUvAuthParam.len != (pinUvAuthProtocol == 1 ? 16u : 32u)) {
+        CBOR_ERROR(CTAP1_ERR_INVALID_PARAMETER);
+    }
+
     cbor_encoder_init(&encoder, ctap_resp->init.data + 1, CTAP_MAX_CBOR_PAYLOAD, 0);
     if (subcommand == 0x0) {
         CBOR_ERROR(CTAP2_ERR_MISSING_PARAMETER);
@@ -529,7 +559,7 @@ int cbor_client_pin(const uint8_t *data, size_t len) {
         if (new_pin_plain_len > sizeof(paddedNewPin)) {
             CBOR_ERROR(CTAP1_ERR_INVALID_PARAMETER);
         }
-        ret = decrypt((uint8_t)pinUvAuthProtocol, sharedSecret, newPinEnc.data, (uint16_t)newPinEnc.len, paddedNewPin);
+        ret = decrypt((uint8_t)pinUvAuthProtocol, sharedSecret, newPinEnc.data, newPinEnc.len, paddedNewPin, sizeof(paddedNewPin));
         mbedtls_platform_zeroize(sharedSecret, sizeof(sharedSecret));
         if (ret != 0) {
             CBOR_ERROR(CTAP2_ERR_PIN_AUTH_INVALID);
@@ -639,7 +669,7 @@ int cbor_client_pin(const uint8_t *data, size_t len) {
         uint8_t retries = pin_data[0] & PIN_RETRY_COUNT_MASK;
         bool power_cycle_locked = (pin_data[0] & PIN_RETRY_POWER_CYCLE) != 0;
         uint8_t paddedNewPin[256 + IV_SIZE] = { 0 };
-        ret = decrypt((uint8_t)pinUvAuthProtocol, sharedSecret, pinHashEnc.data, (uint16_t)pinHashEnc.len, paddedNewPin);
+        ret = decrypt((uint8_t)pinUvAuthProtocol, sharedSecret, pinHashEnc.data, pinHashEnc.len, paddedNewPin, sizeof(paddedNewPin));
         if (ret != 0) {
             mbedtls_platform_zeroize(sharedSecret, sizeof(sharedSecret));
             CBOR_ERROR(CTAP2_ERR_PIN_AUTH_INVALID);
@@ -717,7 +747,7 @@ int cbor_client_pin(const uint8_t *data, size_t len) {
         if (new_pin_plain_len > sizeof(paddedNewPin)) {
             CBOR_ERROR(CTAP1_ERR_INVALID_PARAMETER);
         }
-        ret = decrypt((uint8_t)pinUvAuthProtocol, sharedSecret, newPinEnc.data, (uint16_t)newPinEnc.len, paddedNewPin);
+        ret = decrypt((uint8_t)pinUvAuthProtocol, sharedSecret, newPinEnc.data, newPinEnc.len, paddedNewPin, sizeof(paddedNewPin));
         mbedtls_platform_zeroize(sharedSecret, sizeof(sharedSecret));
         if (ret != 0) {
             CBOR_ERROR(CTAP2_ERR_PIN_AUTH_INVALID);
@@ -840,7 +870,7 @@ int cbor_client_pin(const uint8_t *data, size_t len) {
         uint8_t retries = pin_data[0] & PIN_RETRY_COUNT_MASK;
         bool power_cycle_locked = (pin_data[0] & PIN_RETRY_POWER_CYCLE) != 0;
         uint8_t paddedNewPin[64], poff = ((uint8_t)pinUvAuthProtocol - 1) * IV_SIZE;
-        ret = decrypt((uint8_t)pinUvAuthProtocol, sharedSecret, pinHashEnc.data, (uint16_t)pinHashEnc.len, paddedNewPin);
+        ret = decrypt((uint8_t)pinUvAuthProtocol, sharedSecret, pinHashEnc.data, pinHashEnc.len, paddedNewPin, sizeof(paddedNewPin));
         if (ret != 0) {
             mbedtls_platform_zeroize(sharedSecret, sizeof(sharedSecret));
             CBOR_ERROR(CTAP2_ERR_PIN_AUTH_INVALID);

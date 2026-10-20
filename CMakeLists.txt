@@ -277,10 +277,24 @@ add_compile_options("-fmacro-prefix-map=${CMAKE_CURRENT_LIST_DIR}/=")
 
 SET_BUILD_NUMBER("${CMAKE_CURRENT_LIST_DIR}")
 
+set(CBOR_SOURCES
+    ${CMAKE_CURRENT_LIST_DIR}/third-party/tinycbor/src/cborencoder.c
+    ${CMAKE_CURRENT_LIST_DIR}/third-party/tinycbor/src/cborparser.c
+    ${CMAKE_CURRENT_LIST_DIR}/third-party/tinycbor/src/cborparser_dup_string.c
+)
+add_library(tinycbor STATIC ${CBOR_SOURCES})
+target_include_directories(tinycbor PUBLIC ${CMAKE_CURRENT_LIST_DIR}/third-party/tinycbor/src)
+
 if(ENABLE_EMULATION)
     add_compile_definitions(ENABLE_EMULATION)
     SET_VERSION(ver_major ver_minor "${CMAKE_CURRENT_LIST_DIR}/src/fido/version.h")
     enable_testing()
+
+    add_executable(fido_client_pin_test tests/fido_client_pin_test.c)
+    target_include_directories(fido_client_pin_test PRIVATE ${INCLUDES} ${SYSTEM_INCLUDES})
+    target_compile_options(fido_client_pin_test PRIVATE -Wall -Wextra -Werror)
+    target_link_libraries(fido_client_pin_test PRIVATE mbedtls tinycbor)
+    add_test(NAME fido_client_pin_test COMMAND fido_client_pin_test)
 
     add_executable(piv_security_test tests/piv_security_test.c src/tlv.c)
     target_include_directories(piv_security_test PRIVATE ${INCLUDES} ${SYSTEM_INCLUDES})
@@ -381,14 +395,6 @@ if(ENABLE_EMULATION)
     target_link_libraries(object_policy_test PRIVATE mbedtls)
     add_test(NAME object_policy_test COMMAND object_policy_test)
 else()
-    set(CBOR_SOURCES
-        ${CMAKE_CURRENT_LIST_DIR}/third-party/tinycbor/src/cborencoder.c
-        ${CMAKE_CURRENT_LIST_DIR}/third-party/tinycbor/src/cborparser.c
-        ${CMAKE_CURRENT_LIST_DIR}/third-party/tinycbor/src/cborparser_dup_string.c
-    )
-    add_library(tinycbor STATIC ${CBOR_SOURCES})
-    target_include_directories(tinycbor SYSTEM PUBLIC ${CMAKE_CURRENT_LIST_DIR}/third-party/tinycbor/src)
-
     pico_sdk_init()
 
     if(NOT PICO_RP2350)
