@@ -45,6 +45,7 @@ typedef struct queue queue_t;
 #define EV_BUTTON_TIMEOUT        16
 #define EV_BUTTON_PRESSED        32
 #define EV_BUTTON_CANCELLED      64
+#define EV_OTP_CMD_AVAILABLE    128
 
 #define EV_PRESS_BUTTON_TIMEOUT_SHIFT 8 // Upper byte carries the timeout in seconds.
 #define EV_PRESS_BUTTON_TIMEOUT_MASK (0xffu << EV_PRESS_BUTTON_TIMEOUT_SHIFT)
@@ -92,6 +93,7 @@ extern void usb_send_event(uint32_t flag);
 extern void timeout_stop(void);
 extern void timeout_start(void);
 extern bool is_busy(void);
+extern uint8_t card_active_interface(void);
 extern void usb_desc_setup(void);
 
 #ifdef USB_ITF_HID

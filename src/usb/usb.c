@@ -26,6 +26,9 @@
 #define multicore_launch_func_core1(a) multicore_launch_core1((void (*) (void))a)
 #include "apdu.h"
 #include "tusb.h"
+#ifdef ENABLE_OTP_APP
+#include "fido/otp_transport.h"
+#endif
 
 // Device specific functions
 static uint32_t *timeout_counter = NULL;
@@ -182,6 +185,8 @@ void timeout_start(void) {
     timeout = board_millis();
 }
 
+uint8_t card_active_interface(void) { return card_locked_itf; }
+
 bool is_busy(void) {
     return timeout > 0;
 }
@@ -253,6 +258,9 @@ void usb_task(void) {
 #endif
 #ifdef USB_ITF_CCID
     ccid_task();
+#endif
+#ifdef ENABLE_OTP_APP
+    otp_hid_task();
 #endif
 }
 

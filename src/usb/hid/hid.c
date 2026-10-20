@@ -115,7 +115,7 @@ uint16_t tud_hid_get_report_cb(uint8_t itf, uint8_t report_id, hid_report_type_t
     memset(buffer, 0, reqlen);
     DEBUG_PAYLOAD(buffer, reqlen);
     if (hid_get_report_cb) {
-        hid_get_report_cb(itf, report_id, report_type, buffer, reqlen);
+        return hid_get_report_cb(itf, report_id, report_type, buffer, reqlen);
     }
     return reqlen;
 }
@@ -199,9 +199,16 @@ static void send_hid_report(uint8_t report_id) {
     }
 }
 
+static bool busy_reply_pending = false;
+
 void tud_hid_report_complete_cb(uint8_t instance, uint8_t const *report, uint16_t len) {
     //printf("report_complete %d %d %d\n", instance, len, send_buffer_size[instance]);
     if (instance == ITF_HID_CTAP && len == 64) {
+        if (busy_reply_pending) {
+            busy_reply_pending = false;
+            last_write_result[instance] = WRITE_SUCCESS;
+            return;
+        }
         CTAPHID_FRAME *req = (CTAPHID_FRAME *) report;
         if (last_write_result[instance] == WRITE_PENDING) {
             last_write_result[instance] = WRITE_SUCCESS;
@@ -267,6 +274,27 @@ void tud_hid_set_report_cb(uint8_t itf, uint8_t report_id, hid_report_type_t rep
             if (bufsize != HID_RPT_SIZE) {
                 return;
             }
+            if (is_busy()) {
+                const CTAPHID_FRAME *incoming = (const CTAPHID_FRAME *)buffer;
+                if (card_active_interface() == ITF_HID && ctap_req &&
+                    incoming->cid == ctap_req->cid && FRAME_TYPE(incoming) == TYPE_INIT &&
+                    incoming->init.cmd == CTAPHID_CANCEL && MSG_LEN(incoming) == 0) {
+                    cancel_button = true;
+                    return;
+                }
+                static CTAPHID_FRAME busy_response;
+                memset(&busy_response, 0, sizeof(busy_response));
+                busy_response.cid = incoming->cid;
+                busy_response.init.cmd = CTAPHID_ERROR;
+                busy_response.init.bcntl = 1;
+                busy_response.init.data[0] = CTAP1_ERR_CHANNEL_BUSY;
+                if (driver_write_hid(itf, CONST_BYTE_ARRAY((const uint8_t *)&busy_response, HID_RPT_SIZE)) > 0) {
+                    /* This report is independent of the active response. Its
+                     * completion must not advance that response's pointers. */
+                    busy_reply_pending = true;
+                }
+                return;
+            }
             memcpy(hid_rx[itf].buffer + hid_rx[itf].w_ptr, buffer, bufsize);
             hid_rx[itf].w_ptr += bufsize;
             int proc_pkt = driver_process_usb_packet_hid(bufsize);
@@ -312,6 +340,7 @@ extern int cbor_process(uint8_t last_cmd, const uint8_t *data, size_t len);
 static uint32_t last_keepalive_time = 0;
 
 int driver_process_usb_nopacket_hid(void) {
+    if (is_busy()) return 0;
     if (last_packet_time > 0 && last_packet_time + 500 < board_millis()) {
         ctap_error(CTAP1_ERR_MSG_TIMEOUT);
         last_packet_time = 0;

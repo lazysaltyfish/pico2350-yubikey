@@ -177,6 +177,8 @@ static int driver_init_ccid(uint8_t itf) {
 void tud_vendor_rx_cb(uint8_t itf, const uint8_t *buffer, uint16_t bufsize) {
     (void)buffer;
     (void)bufsize;
+    /* Leave data in TinyUSB's FIFO until the sole APDU worker is idle. */
+    if (is_busy()) return;
     uint32_t len = tud_vendor_n_available(itf);
     do {
         uint16_t remaining = (uint16_t)(sizeof(ccid_rx[itf].buffer) - ccid_rx[itf].w_ptr);
@@ -192,6 +194,7 @@ void tud_vendor_rx_cb(uint8_t itf, const uint8_t *buffer, uint16_t bufsize) {
             ccid_rx[itf].r_ptr = ccid_rx[itf].w_ptr = 0;
         }
         len -= tlen;
+        if (is_busy()) break;
     } while (len > 0);
 }
 
@@ -391,6 +394,10 @@ void ccid_task(void) {
             else if (status == PICOKEYS_ERR_BLOCKED) {
                 driver_exec_timeout_ccid(itf);
             }
+        }
+        if (!is_busy() && ccid_tx[itf].w_ptr == ccid_tx[itf].r_ptr) {
+            if (ccid_rx[itf].w_ptr - ccid_rx[itf].r_ptr >= 10) driver_process_usb_packet_ccid(itf, 0);
+            if (!is_busy() && tud_vendor_n_available(itf)) tud_vendor_rx_cb(itf, NULL, 0);
         }
         if (ccid_tx[itf].w_ptr > ccid_tx[itf].r_ptr) {
             if (driver_write_ccid(itf, CONST_BYTE_ARRAY(ccid_tx[itf].buffer + ccid_tx[itf].r_ptr, ccid_tx[itf].w_ptr - ccid_tx[itf].r_ptr)) > 0) {

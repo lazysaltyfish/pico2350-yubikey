@@ -311,10 +311,24 @@ if(ENABLE_EMULATION)
     add_test(NAME piv_security_test COMMAND piv_security_test)
 
     add_executable(hsmauth_list_test tests/hsmauth_list_test.c)
+    target_include_directories(hsmauth_list_test BEFORE PRIVATE tests/support/include)
     target_include_directories(hsmauth_list_test PRIVATE ${INCLUDES} ${SYSTEM_INCLUDES})
     target_compile_options(hsmauth_list_test PRIVATE -Wall -Wextra -Wshadow -Werror)
     target_link_libraries(hsmauth_list_test PRIVATE mbedtls)
     add_test(NAME hsmauth_list_test COMMAND hsmauth_list_test)
+
+    add_executable(otp_transport_test tests/otp_transport_test.c src/fido/otp_transport.c)
+    target_include_directories(otp_transport_test BEFORE PRIVATE tests/support/include)
+    target_include_directories(otp_transport_test PRIVATE ${INCLUDES})
+    target_compile_options(otp_transport_test PRIVATE -Wall -Wextra -Wshadow -Werror -UNDEBUG)
+    target_link_libraries(otp_transport_test PRIVATE mbedtls)
+    add_test(NAME otp_transport_test COMMAND otp_transport_test)
+
+    add_executable(usb_arbitration_test tests/usb_arbitration_test.c)
+    target_include_directories(usb_arbitration_test BEFORE PRIVATE tests/support/usb tests/support/include)
+    target_include_directories(usb_arbitration_test PRIVATE ${INCLUDES})
+    target_compile_options(usb_arbitration_test PRIVATE -Wall -Wextra -Wshadow -Werror -UNDEBUG)
+    add_test(NAME usb_arbitration_test COMMAND usb_arbitration_test)
 
     add_executable(fido_oath_put_test tests/fido_oath_put_test.c src/fido/oath_put.c src/tlv.c)
     target_include_directories(fido_oath_put_test PRIVATE ${INCLUDES})
@@ -514,6 +528,7 @@ else()
         list(APPEND SOURCES
             ${CMAKE_CURRENT_LIST_DIR}/src/fido/otp_container.c
             ${CMAKE_CURRENT_LIST_DIR}/src/fido/otp.c
+            ${CMAKE_CURRENT_LIST_DIR}/src/fido/otp_transport.c
         )
     endif()
 

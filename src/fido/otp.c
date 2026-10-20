@@ -48,6 +48,7 @@ void append_keyboard_buffer(const_byte_array_t data) {
 #include "crypto_utils.h"
 #include "management.h"
 #include "otp_container.h"
+#include "otp_transport.h"
 
 #define FIXED_SIZE          16
 #define KEY_SIZE            16
@@ -340,8 +341,6 @@ static int otp_migrate_slots(void) {
 
 extern int (*hid_set_report_cb)(uint8_t, uint8_t, hid_report_type_t, uint8_t const *, uint16_t);
 extern uint16_t (*hid_get_report_cb)(uint8_t, uint8_t, hid_report_type_t, uint8_t *, uint16_t);
-static int otp_hid_set_report_cb(uint8_t, uint8_t, hid_report_type_t, uint8_t const *, uint16_t);
-static uint16_t otp_hid_get_report_cb(uint8_t, uint8_t, hid_report_type_t, uint8_t *, uint16_t);
 
 const uint8_t otp_aid[] = {
     7,
@@ -443,16 +442,11 @@ static uint16_t calculate_crc(const uint8_t *data, size_t data_len) {
 }
 
 static uint8_t session_counter[FIDO_OTP_SLOT_COUNT] = { 0 };
-static int otp_button_pressed(uint8_t slot) {
+static int otp_button_pressed_impl(uint8_t slot) {
     init_otp();
     if (!cap_supported(CAP_OTP)) {
         return 3;
     }
-#ifndef ENABLE_EMULATION
-    if (slot == 1 && button_pressed_duration >= 1500) {
-        slot = 2;
-    }
-#endif
     if (slot < 1 || slot > FIDO_OTP_SLOT_COUNT) {
         return 1;
     }
@@ -607,6 +601,21 @@ static int otp_button_pressed(uint8_t slot) {
     return 0;
 }
 
+static int otp_button_pressed(uint8_t slot) {
+#ifndef ENABLE_EMULATION
+    if (slot == 1 && button_pressed_duration >= 1500) slot = 2;
+#endif
+    return otp_hid_queue_button(slot);
+}
+
+int otp_hid_button(uint8_t slot) {
+    uint8_t response[64] = {0};
+    apdu = (struct apdu){.rdata=response, .ne=sizeof(response)};
+    int result = otp_button_pressed_impl(slot);
+    apdu.rdata = NULL;
+    return result;
+}
+
 INITIALIZER( otp_ctor ) {
     register_app(otp_select, otp_aid);
     button_pressed_cb = otp_button_pressed;
@@ -659,19 +668,17 @@ static uint16_t otp_status_ext(void) {
     return SW_OK();
 }
 
-static uint16_t otp_status(bool is_otp) {
+void otp_hid_refresh_status(void) {
+    uint8_t snapshot[8] = {0};
+    uint16_t used = 1;
     if (scanned == false) {
         scan_all();
         scanned = true;
     }
-    res_APDU_size = 0;
-    if (is_otp) {
-        res_APDU_size++;
-    }
-    res_APDU[res_APDU_size++] = PICO_FIDO_VERSION_MAJOR;
-    res_APDU[res_APDU_size++] = PICO_FIDO_VERSION_MINOR;
-    res_APDU[res_APDU_size++] = PICO_FIDO_VERSION_PATCH;
-    res_APDU[res_APDU_size++] = config_seq;
+    snapshot[used++] = PICO_FIDO_VERSION_MAJOR;
+    snapshot[used++] = PICO_FIDO_VERSION_MINOR;
+    snapshot[used++] = PICO_FIDO_VERSION_PATCH;
+    snapshot[used++] = config_seq;
     uint8_t opts = 0;
     if (otp_slot_has_data(EF_OTP_SLOT1)) {
         uint8_t data[OTP_SLOT_PLAIN_MAX] = { 0 };
@@ -697,16 +704,21 @@ static uint16_t otp_status(bool is_otp) {
         }
         mbedtls_platform_zeroize(data, sizeof(data));
     }
-    res_APDU[res_APDU_size++] = opts;
-    res_APDU[res_APDU_size++] = 0;
-    res_APDU[res_APDU_size++] = status_byte;
-    if (is_otp) {
-        res_APDU_size = 0;
-    }
-    else {
-        apdu.ne = res_APDU_size;
-    }
+    snapshot[used++] = opts;
+    snapshot[used++] = 0;
+    snapshot[used++] = status_byte;
+    otp_hid_update_status(snapshot);
+}
 
+static uint16_t otp_status(bool is_otp) {
+    /* Build the snapshot without borrowing the active request's APDU pointers. */
+    otp_hid_refresh_status();
+    uint8_t snapshot[8];
+    /* Worker-owned refresh publishes a snapshot; the getter is USB-only. */
+    otp_hid_copy_status(snapshot);
+    memcpy(res_APDU, snapshot + (is_otp ? 0 : 1), is_otp ? 8 : 7);
+    res_APDU_size = is_otp ? 0 : 7;
+    if (!is_otp) apdu.ne = res_APDU_size;
     return SW_OK();
 }
 
@@ -1160,105 +1172,14 @@ static int otp_process_apdu(void) {
     return SW_INS_NOT_SUPPORTED();
 }
 
-uint8_t otp_frame_rx[70] = {0};
-uint8_t otp_frame_tx[70] = {0};
-uint8_t otp_exp_seq = 0, otp_curr_seq = 0;
-uint8_t otp_header[4] = {0};
-
-static int otp_send_frame(uint8_t *frame, size_t frame_len) {
-    if (frame_len > (size_t)UINT8_MAX * 7u - sizeof(uint16_t)) {
-        return PICOKEYS_WRONG_LENGTH;
-    }
-    uint16_t crc = calculate_crc(frame, frame_len);
-    frame_len += put_uint16_le(~crc, frame + frame_len);
-    *get_send_buffer_size(ITF_KEYBOARD) = (uint16_t)frame_len;
-    otp_exp_seq = (uint8_t)((frame_len + 6u) / 7u);
-    otp_curr_seq = 0;
-    return 0;
-}
-
-static int otp_hid_set_report_cb(uint8_t itf, uint8_t report_id, hid_report_type_t report_type, uint8_t const *buffer, uint16_t bufsize) {
-    (void)itf;
-    (void)report_id;
-    (void)bufsize;
-    if (report_type == 3) {
-        DEBUG_PAYLOAD(buffer, bufsize);
-        if (buffer[7] == 0xFF) { // reset
-            *get_send_buffer_size(ITF_KEYBOARD) = 0;
-            otp_curr_seq = otp_exp_seq = 0;
-            memset(otp_frame_tx, 0, sizeof(otp_frame_tx));
-        }
-        else if (buffer[7] & 0x80) { // a frame
-            uint8_t rseq = buffer[7] & 0x1F;
-            if (rseq < 10) {
-                if (rseq == 0) {
-                    memset(otp_frame_rx, 0, sizeof(otp_frame_rx));
-                }
-                memcpy(otp_frame_rx + rseq * 7, buffer, 7);
-                if (rseq == 9) {
-                    DEBUG_DATA(otp_frame_rx, sizeof(otp_frame_rx));
-                    DEBUG_PAYLOAD(otp_frame_rx, sizeof(otp_frame_rx));
-                    uint16_t residual_crc = calculate_crc(otp_frame_rx, 64), rcrc = get_uint16_le(otp_frame_rx + 65);
-                    uint8_t slot_id = otp_frame_rx[64];
-                    if (residual_crc == rcrc) {
-                        uint8_t hdr[5];
-                        apdu.header = hdr;
-                        apdu.data = otp_frame_rx;
-                        apdu.nc = 64;
-                        apdu.rdata = otp_frame_tx;
-                        apdu.header[0] = 0;
-                        apdu.header[1] = 0x01;
-                        apdu.header[2] = slot_id;
-                        apdu.header[3] = 0;
-                        _is_otp = true;
-                        int ret = otp_process_apdu();
-                        if (ret == 0x9000 && res_APDU_size > 0) {
-                            otp_send_frame(apdu.rdata, apdu.rlen);
-                        }
-                        _is_otp = false;
-                    }
-                    else {
-                        printf("[OTP] Bad CRC!\n");
-                    }
-                }
-            }
-        }
-        return 1;
-    }
-    return 0;
-}
-
-static uint16_t otp_hid_get_report_cb(uint8_t itf,
-                                      uint8_t report_id,
-                                      hid_report_type_t report_type,
-                                      uint8_t *buffer,
-                                      uint16_t reqlen) {
-    // TODO not Implemented
-    (void) itf;
-    (void) report_id;
-    (void) report_type;
-    (void) buffer;
-    (void) reqlen;
-    uint16_t send_buffer_size = *get_send_buffer_size(ITF_KEYBOARD);
-    if (send_buffer_size > 0) {
-        uint8_t seq = otp_curr_seq++;
-        memset(buffer, 0, 8);
-        memcpy(buffer, otp_frame_tx + 7 * seq, MIN(7, send_buffer_size));
-        buffer[7] = 0x40 | seq;
-        DEBUG_DATA(buffer, 8);
-        *get_send_buffer_size(ITF_KEYBOARD) -= MIN(7, send_buffer_size);
-    }
-    else if (otp_curr_seq == otp_exp_seq && otp_exp_seq > 0) {
-        memset(buffer, 0, 7);
-        buffer[7] = 0x40;
-        DEBUG_DATA(buffer,8);
-        otp_curr_seq = otp_exp_seq = 0;
-    }
-    else {
-        res_APDU = buffer;
-        otp_status(true);
-        DEBUG_DATA(buffer, 8);
-    }
-
-    return reqlen;
+int otp_hid_command(uint8_t command, const uint8_t request[64], uint8_t response[70], size_t *response_len) {
+    uint8_t header[4] = {0, INS_OTP, command, 0};
+    apdu = (struct apdu){.header=header, .data=(uint8_t *)request, .nc=64, .rdata=response, .ne=68};
+    _is_otp = true;
+    int result = otp_process_apdu();
+    _is_otp = false;
+    *response_len = apdu.rlen;
+    /* Do not retain the address of a stack-local header. */
+    apdu.header = NULL;
+    return result;
 }

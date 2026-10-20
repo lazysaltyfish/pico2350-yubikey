@@ -19,6 +19,9 @@
 #include "apdu.h"
 #include "led/led.h"
 #include "usb.h"
+#ifdef ENABLE_OTP_APP
+#include "fido/otp_transport.h"
+#endif
 #include <stdio.h>
 
 uint8_t *rdata_gr = NULL;
@@ -313,6 +316,15 @@ void *apdu_thread(void *arg) {
             break;
         }
 
+#ifdef ENABLE_OTP_APP
+        if (m == EV_OTP_CMD_AVAILABLE) {
+            otp_hid_execute_pending();
+            finished_data_size = 0;
+            flag = EV_EXEC_FINISHED;
+            queue_add_blocking(&card_to_usb_q, &flag);
+            continue;
+        }
+#endif
         process_apdu();
 
 done:   ;

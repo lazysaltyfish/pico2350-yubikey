@@ -68,6 +68,7 @@ bool check_user_presence(void) { return true; }
 uint32_t button_timeout_seconds(void) { return 30; }
 void flash_commit(void) {}
 void timeout_stop(void) {}
+void otp_hid_execute_pending(void) {}
 void led_set_mode(uint32_t mode) { (void)mode; }
 void card_init_core1(void) { assert(false); }
 static void queue_remove_blocking(queue_t *q, void *value) { (void)q; (void)value; assert(false); }
