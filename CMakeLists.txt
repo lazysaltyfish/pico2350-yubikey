@@ -292,6 +292,12 @@ if(ENABLE_EMULATION)
     find_package(Python3 REQUIRED COMPONENTS Interpreter)
     add_test(NAME verification_runner_test COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_LIST_DIR}/tests/verification_runner_test.py")
 
+    add_executable(hsmauth_security_test tests/hsmauth_security_test.c)
+    target_include_directories(hsmauth_security_test PRIVATE ${INCLUDES} ${SYSTEM_INCLUDES})
+    target_compile_options(hsmauth_security_test PRIVATE -Wall -Wextra -Wshadow -Werror -UNDEBUG)
+    target_link_libraries(hsmauth_security_test PRIVATE mbedtls)
+    add_test(NAME hsmauth_security_test COMMAND hsmauth_security_test)
+
     add_executable(fido_client_pin_test tests/fido_client_pin_test.c)
     target_include_directories(fido_client_pin_test PRIVATE ${INCLUDES} ${SYSTEM_INCLUDES})
     target_compile_options(fido_client_pin_test PRIVATE -Wall -Wextra -Werror)

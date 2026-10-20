@@ -92,17 +92,57 @@ typedef struct __attribute__((packed)) {
     uint8_t tag[16];
 } hsmauth_cred_t;
 
-static uint8_t ephem_priv[32];
-static uint8_t ephem_pub[65];
-static bool ephem_valid = false;
+typedef struct {
+    bool valid;
+    uint8_t slot;
+    uint8_t algo;
+    uint8_t credential_hash[32];
+    uint8_t priv[32];
+    uint8_t pub[65];
+    uint8_t nonce[8];
+} hsmauth_challenge_t;
+
+static hsmauth_challenge_t challenge;
+
+static void hsmauth_clear_challenge(void) {
+    mbedtls_platform_zeroize(&challenge, sizeof(challenge));
+}
+
+static int hsmauth_bind_challenge(uint8_t slot, const hsmauth_cred_t *cred) {
+    /* Bind the challenge to credential contents, excluding the storage IV/tag
+     * and retry counter, which change on an otherwise harmless PIN verify. */
+    hsmauth_cred_t identity = *cred;
+    identity.retries = 0;
+    int ret = mbedtls_sha256((const uint8_t *)&identity, offsetof(hsmauth_cred_t, iv),
+                             challenge.credential_hash, 0);
+    mbedtls_platform_zeroize(&identity, sizeof(identity));
+    if (ret == 0) {
+        challenge.slot = slot;
+        challenge.algo = cred->algo;
+        challenge.valid = true;
+    }
+    return ret;
+}
+
+static bool hsmauth_challenge_matches(const hsmauth_challenge_t *pending,
+                                       uint8_t slot, const hsmauth_cred_t *cred) {
+    if (!pending->valid || pending->slot != slot || pending->algo != cred->algo) return false;
+    hsmauth_cred_t identity = *cred;
+    identity.retries = 0;
+    uint8_t digest[32];
+    int ret = mbedtls_sha256((const uint8_t *)&identity, offsetof(hsmauth_cred_t, iv), digest, 0);
+    bool matches = ret == 0 && mbedtls_ct_memcmp(digest, pending->credential_hash, sizeof(digest)) == 0;
+    mbedtls_platform_zeroize(&identity, sizeof(identity));
+    mbedtls_platform_zeroize(digest, sizeof(digest));
+    return matches;
+}
 /* LIST can exceed the USB transmit buffer. Keep its public metadata stable
  * while the APDU layer copies bounded chunks for ISO GET RESPONSE. */
 static uint8_t hsmauth_list_response[HSMAUTH_MAX_CREDS * (HSMAUTH_MAX_LABEL_LEN + HSMAUTH_LIST_ITEM_OVERHEAD)];
 
 static int hsmauth_rng(void *ctx, unsigned char *buf, size_t len) {
     (void)ctx;
-    random_fill_buffer(BYTE_ARRAY(buf, len));
-    return 0;
+    return random_fill_buffer(BYTE_ARRAY(buf, len));
 }
 
 static void hsmauth_derive_mk(uint8_t mk[32]) {
@@ -289,7 +329,7 @@ static int hsmauth_verify_cred_pw(uint8_t slot, hsmauth_cred_t *cred, const uint
     return set_res_sw(0x63, (uint8_t)(0xC0 | (cred->retries & 0x0F)));
 }
 
-static void hsmauth_scp03_kdf(const uint8_t key[16], uint8_t deriv_const, uint16_t out_bits,
+static int hsmauth_scp03_kdf(const uint8_t key[16], uint8_t deriv_const, uint16_t out_bits,
                               const uint8_t context[16], uint8_t out[16]) {
     uint8_t msg[32];
     memset(msg, 0, 11);
@@ -300,7 +340,7 @@ static void hsmauth_scp03_kdf(const uint8_t key[16], uint8_t deriv_const, uint16
     msg[15] = 0x01;
     memcpy(msg + 16, context, 16);
     const mbedtls_cipher_info_t *ci = mbedtls_cipher_info_from_type(MBEDTLS_CIPHER_AES_128_ECB);
-    mbedtls_cipher_cmac(ci, key, 128, msg, sizeof(msg), out);
+    return mbedtls_cipher_cmac(ci, key, 128, msg, sizeof(msg), out);
 }
 
 static int cmd_hsmauth_get_version(void) {
@@ -563,118 +603,150 @@ static int cmd_hsmauth_change_cred_password(void) {
 }
 
 static int cmd_hsmauth_get_challenge(void) {
-    size_t pos = 0;
-    uint8_t t = 0;
-    const uint8_t *v = NULL;
-    size_t l = 0;
-    const uint8_t *label = NULL, *pw = NULL;
-    size_t label_len = 0;
+    hsmauth_clear_challenge();
+    size_t pos = 0, label_len = 0;
+    uint8_t t;
+    const uint8_t *v, *label = NULL, *pw = NULL;
+    size_t l;
     while (hsmauth_next_tlv(apdu.data, apdu.nc, &pos, &t, &v, &l)) {
-        if (t == HSMAUTH_TAG_LABEL) { label = v; label_len = l; }
-        else if (t == HSMAUTH_TAG_CREDENTIAL_PASSWORD && l == 16) pw = v;
+        if (t == HSMAUTH_TAG_LABEL) {
+            if (label) return SW_WRONG_DATA();
+            label = v;
+            label_len = l;
+        }
+        else if (t == HSMAUTH_TAG_CREDENTIAL_PASSWORD) {
+            if (pw || l != 16) return SW_WRONG_DATA();
+            pw = v;
+        }
     }
-    if (!label || label_len < 1 || label_len > 64) return SW_WRONG_DATA();
+    if (pos != apdu.nc || !label || label_len < 1 || label_len > 64) return SW_WRONG_DATA();
     hsmauth_cred_t cred;
     int slot = hsmauth_find_cred(label, label_len, &cred);
     if (slot < 0) return SW_FILE_NOT_FOUND();
-
+    int ret = PICOKEYS_OK;
     if (cred.algo == HSMAUTH_ALG_AES128) {
-        random_fill_buffer(BYTE_ARRAY(res_APDU, 8));
-        res_APDU_size = 8;
-        mbedtls_platform_zeroize(&cred, sizeof(cred));
-        return SW_OK();
+        ret = random_fill_buffer(BYTE_ARRAY(challenge.nonce, sizeof(challenge.nonce)));
     }
-    else {
-        if (pw) {
-            int rc = hsmauth_verify_cred_pw((uint8_t)slot, &cred, pw, 16);
-            if (rc != SW_OK()) {
-                mbedtls_platform_zeroize(&cred, sizeof(cred));
-                return rc;
-            }
+    else if (cred.algo == HSMAUTH_ALG_ECP256) {
+        /* Firmware 5.8 requires the credential password before allocating an
+         * asymmetric exchange. It is checked again when session keys are used. */
+        if (!pw) {
+            mbedtls_platform_zeroize(&cred, sizeof(cred));
+            return SW_WRONG_DATA();
         }
-        mbedtls_platform_zeroize(&cred, sizeof(cred));
+        int rc = hsmauth_verify_cred_pw((uint8_t)slot, &cred, pw, 16);
+        if (rc != SW_OK()) {
+            mbedtls_platform_zeroize(&cred, sizeof(cred));
+            return rc;
+        }
         mbedtls_ecp_keypair kp;
         mbedtls_ecp_keypair_init(&kp);
-        int ret = mbedtls_ecp_gen_key(MBEDTLS_ECP_DP_SECP256R1, &kp, hsmauth_rng, NULL);
-        if (ret == 0) ret = mbedtls_mpi_write_binary(&kp.d, ephem_priv, 32);
+        ret = mbedtls_ecp_gen_key(MBEDTLS_ECP_DP_SECP256R1, &kp, hsmauth_rng, NULL);
+        if (ret == 0) ret = mbedtls_mpi_write_binary(&kp.d, challenge.priv, sizeof(challenge.priv));
         if (ret == 0) {
             size_t olen = 0;
             ret = mbedtls_ecp_point_write_binary(&kp.grp, &kp.Q, MBEDTLS_ECP_PF_UNCOMPRESSED,
-                                                 &olen, ephem_pub, sizeof(ephem_pub));
+                                                 &olen, challenge.pub, sizeof(challenge.pub));
+            if (ret == 0 && olen != sizeof(challenge.pub)) ret = PICOKEYS_EXEC_ERROR;
         }
         mbedtls_ecp_keypair_free(&kp);
-        if (ret != 0) return SW_EXEC_ERROR();
-        ephem_valid = true;
-        memcpy(res_APDU, ephem_pub, 65);
-        res_APDU_size = 65;
-        return SW_OK();
     }
+    else {
+        ret = PICOKEYS_WRONG_DATA;
+    }
+    if (ret == 0) ret = hsmauth_bind_challenge((uint8_t)slot, &cred);
+    mbedtls_platform_zeroize(&cred, sizeof(cred));
+    if (ret != 0) {
+        hsmauth_clear_challenge();
+        return SW_EXEC_ERROR();
+    }
+    res_APDU_size = challenge.algo == HSMAUTH_ALG_AES128 ? sizeof(challenge.nonce) : sizeof(challenge.pub);
+    memcpy(res_APDU, challenge.algo == HSMAUTH_ALG_AES128 ? challenge.nonce : challenge.pub, res_APDU_size);
+    return SW_OK();
 }
 
-static int cmd_hsmauth_calculate(void) {
+static int hsmauth_calculate(const hsmauth_challenge_t *pending) {
     size_t pos = 0;
-    uint8_t t = 0;
-    const uint8_t *v = NULL;
-    size_t l = 0;
+    uint8_t t;
+    const uint8_t *v;
+    size_t l;
     const uint8_t *label = NULL, *ctx = NULL, *pk_sd = NULL, *card_crypto = NULL, *pw = NULL;
     size_t label_len = 0, ctx_len = 0, pk_sd_len = 0, crypto_len = 0;
     while (hsmauth_next_tlv(apdu.data, apdu.nc, &pos, &t, &v, &l)) {
         switch (t) {
-            case HSMAUTH_TAG_LABEL: label = v; label_len = l; break;
-            case HSMAUTH_TAG_CONTEXT: ctx = v; ctx_len = l; break;
-            case HSMAUTH_TAG_PUBLIC_KEY: pk_sd = v; pk_sd_len = l; break;
-            case HSMAUTH_TAG_RESPONSE: card_crypto = v; crypto_len = l; break;
-            case HSMAUTH_TAG_CREDENTIAL_PASSWORD: if (l == 16) pw = v; break;
+            case HSMAUTH_TAG_LABEL:
+                if (label) return SW_WRONG_DATA();
+                label = v; label_len = l; break;
+            case HSMAUTH_TAG_CONTEXT:
+                if (ctx) return SW_WRONG_DATA();
+                ctx = v; ctx_len = l; break;
+            case HSMAUTH_TAG_PUBLIC_KEY:
+                if (pk_sd) return SW_WRONG_DATA();
+                pk_sd = v; pk_sd_len = l; break;
+            case HSMAUTH_TAG_RESPONSE:
+                if (card_crypto) return SW_WRONG_DATA();
+                card_crypto = v; crypto_len = l; break;
+            case HSMAUTH_TAG_CREDENTIAL_PASSWORD:
+                if (pw || l != 16) return SW_WRONG_DATA();
+                pw = v; break;
             default: break;
         }
     }
-    if (!label || label_len < 1 || label_len > 64 || !pw || !ctx || !card_crypto) {
+    if (pos != apdu.nc || !label || label_len < 1 || label_len > 64 || !pw || !ctx || !card_crypto) {
         return SW_WRONG_DATA();
     }
     hsmauth_cred_t cred;
     int slot = hsmauth_find_cred(label, label_len, &cred);
     if (slot < 0) return SW_FILE_NOT_FOUND();
 
+    bool matches = hsmauth_challenge_matches(pending, (uint8_t)slot, &cred);
+    if ((pending->valid && !matches) || (cred.algo == HSMAUTH_ALG_ECP256 && !matches)) {
+        mbedtls_platform_zeroize(&cred, sizeof(cred));
+        return SW_CONDITIONS_NOT_SATISFIED();
+    }
+    if ((cred.algo == HSMAUTH_ALG_AES128 && (ctx_len != 16 || crypto_len != 8 ||
+         (pending->valid && mbedtls_ct_memcmp(ctx, pending->nonce, 8) != 0))) ||
+        (cred.algo == HSMAUTH_ALG_ECP256 && (ctx_len != 130 || !pk_sd || pk_sd_len != 65 ||
+         crypto_len != 16 || mbedtls_ct_memcmp(ctx, pending->pub, 65) != 0)) ||
+        (cred.algo != HSMAUTH_ALG_AES128 && cred.algo != HSMAUTH_ALG_ECP256)) {
+        mbedtls_platform_zeroize(&cred, sizeof(cred));
+        return SW_WRONG_DATA();
+    }
     int rc = hsmauth_verify_cred_pw((uint8_t)slot, &cred, pw, 16);
     if (rc != SW_OK()) {
         mbedtls_platform_zeroize(&cred, sizeof(cred));
         return rc;
     }
-
     if (cred.touch_required) {
 #ifdef ENABLE_EMULATION
-        if (!check_user_presence()) {
-            mbedtls_platform_zeroize(&cred, sizeof(cred));
-            return SW_SECURITY_STATUS_NOT_SATISFIED();
-        }
+        bool present = check_user_presence();
 #else
         uint32_t timeout_s = button_timeout_seconds();
         if (timeout_s == 0) timeout_s = 15;
-        if (wait_button_pressed_timeout(timeout_s) != 0) {
+        bool present = wait_button_pressed_timeout(timeout_s) == 0;
+#endif
+        if (!present) {
             mbedtls_platform_zeroize(&cred, sizeof(cred));
             return SW_SECURITY_STATUS_NOT_SATISFIED();
         }
-#endif
     }
 
+    /* Derive into private temporaries. Session material is copied into the
+     * response only after constant-time verification of the peer's proof. */
+    uint8_t keys[64] = {0}, expected[16] = {0};
+    int ret;
     if (cred.algo == HSMAUTH_ALG_AES128) {
-        if (ctx_len != 16 || crypto_len != 8) {
-            mbedtls_platform_zeroize(&cred, sizeof(cred));
-            return SW_WRONG_DATA();
-        }
-        hsmauth_scp03_kdf(cred.secret,      0x04, 0x0080, ctx, res_APDU);
-        hsmauth_scp03_kdf(cred.secret + 16, 0x06, 0x0080, ctx, res_APDU + 16);
-        hsmauth_scp03_kdf(cred.secret + 16, 0x07, 0x0080, ctx, res_APDU + 32);
-        res_APDU_size = 48;
-        mbedtls_platform_zeroize(&cred, sizeof(cred));
-        return SW_OK();
+        /* Older symmetric clients supply their own host challenge. Preserve
+         * that flow when no challenge is pending; the proof authenticates the
+         * supplied context but does not establish local freshness by itself. */
+        ret = hsmauth_scp03_kdf(cred.secret, 0x04, 128, ctx, keys);
+        if (ret == 0) ret = hsmauth_scp03_kdf(cred.secret + 16, 0x06, 128, ctx, keys + 16);
+        if (ret == 0) ret = hsmauth_scp03_kdf(cred.secret + 16, 0x07, 128, ctx, keys + 32);
+        if (ret == 0) ret = hsmauth_scp03_kdf(keys + 16, 0x00, 64, ctx, expected);
+        if (ret == 0 && mbedtls_ct_memcmp(expected, card_crypto, 8) != 0) ret = PICOKEYS_VERIFICATION_FAILED;
+        if (ret == 0) memcpy(res_APDU, keys, 48);
     }
     else {
-        if (ctx_len != 130 || pk_sd_len != 65 || crypto_len != 16) {
-            mbedtls_platform_zeroize(&cred, sizeof(cred));
-            return SW_WRONG_DATA();
-        }
-        /* Compute ShSss = ECDH(sk_oce, pk_sd) and ShSee = ECDH(esk_oce, epk_sd) */
         mbedtls_ecp_group grp;
         mbedtls_ecp_point Q_sd, Q_epk_sd;
         mbedtls_mpi d_static, d_ephem, z_sss, z_see;
@@ -685,19 +757,35 @@ static int cmd_hsmauth_calculate(void) {
         mbedtls_mpi_init(&d_ephem);
         mbedtls_mpi_init(&z_sss);
         mbedtls_mpi_init(&z_see);
-
-        int ret = mbedtls_ecp_group_load(&grp, MBEDTLS_ECP_DP_SECP256R1);
+        ret = mbedtls_ecp_group_load(&grp, MBEDTLS_ECP_DP_SECP256R1);
         if (ret == 0) ret = mbedtls_mpi_read_binary(&d_static, cred.secret, 32);
-        if (ret == 0) ret = mbedtls_mpi_read_binary(&d_ephem, ephem_valid ? ephem_priv : cred.secret, 32);
+        if (ret == 0) ret = mbedtls_mpi_read_binary(&d_ephem, pending->priv, 32);
+        if (ret == 0) ret = mbedtls_ecp_check_privkey(&grp, &d_static);
+        if (ret == 0) ret = mbedtls_ecp_check_privkey(&grp, &d_ephem);
         if (ret == 0) ret = mbedtls_ecp_point_read_binary(&grp, &Q_sd, pk_sd, 65);
+        if (ret == 0) ret = mbedtls_ecp_check_pubkey(&grp, &Q_sd);
         if (ret == 0) ret = mbedtls_ecp_point_read_binary(&grp, &Q_epk_sd, ctx + 65, 65);
+        if (ret == 0) ret = mbedtls_ecp_check_pubkey(&grp, &Q_epk_sd);
         if (ret == 0) ret = mbedtls_ecdh_compute_shared(&grp, &z_see, &Q_epk_sd, &d_ephem, hsmauth_rng, NULL);
         if (ret == 0) ret = mbedtls_ecdh_compute_shared(&grp, &z_sss, &Q_sd, &d_static, hsmauth_rng, NULL);
 
-        uint8_t sh_see[32], sh_sss[32];
-        if (ret == 0) ret = mbedtls_mpi_write_binary(&z_see, sh_see, 32);
-        if (ret == 0) ret = mbedtls_mpi_write_binary(&z_sss, sh_sss, 32);
-
+        /* X9.63 with the YubiHSM asymmetric authentication sharedInfo. */
+        uint8_t kdf_in[64 + 4 + 3] = {0};
+        if (ret == 0) ret = mbedtls_mpi_write_binary(&z_see, kdf_in, 32);
+        if (ret == 0) ret = mbedtls_mpi_write_binary(&z_sss, kdf_in + 32, 32);
+        memcpy(kdf_in + 68, "\x3c\x88\x10", 3);
+        kdf_in[67] = 1;
+        if (ret == 0) ret = mbedtls_sha256(kdf_in, sizeof(kdf_in), keys, 0);
+        kdf_in[67] = 2;
+        if (ret == 0) ret = mbedtls_sha256(kdf_in, sizeof(kdf_in), keys + 32, 0);
+        const mbedtls_cipher_info_t *ci = mbedtls_cipher_info_from_type(MBEDTLS_CIPHER_AES_128_ECB);
+        uint8_t receipt_input[130];
+        memcpy(receipt_input, ctx + 65, 65);
+        memcpy(receipt_input + 65, ctx, 65);
+        if (ret == 0) ret = mbedtls_cipher_cmac(ci, keys, 128, receipt_input, sizeof(receipt_input), expected);
+        if (ret == 0 && mbedtls_ct_memcmp(expected, card_crypto, 16) != 0) ret = PICOKEYS_VERIFICATION_FAILED;
+        if (ret == 0) memcpy(res_APDU, keys + 16, 48);
+        mbedtls_platform_zeroize(kdf_in, sizeof(kdf_in));
         mbedtls_ecp_group_free(&grp);
         mbedtls_ecp_point_free(&Q_sd);
         mbedtls_ecp_point_free(&Q_epk_sd);
@@ -705,27 +793,21 @@ static int cmd_hsmauth_calculate(void) {
         mbedtls_mpi_free(&d_ephem);
         mbedtls_mpi_free(&z_sss);
         mbedtls_mpi_free(&z_see);
-        mbedtls_platform_zeroize(&cred, sizeof(cred));
-
-        if (ret != 0) {
-            return SW_WRONG_DATA();
-        }
-        /* X9.63 SHA-256 KDF over sh_see || sh_sss || counter(1,2) || ctx */
-        uint8_t kdf_in[64 + 4 + 130], block1[32], block2[32];
-        memcpy(kdf_in, sh_see, 32);
-        memcpy(kdf_in + 32, sh_sss, 32);
-        memcpy(kdf_in + 68, ctx, 130);
-        kdf_in[64] = 0; kdf_in[65] = 0; kdf_in[66] = 0; kdf_in[67] = 1;
-        mbedtls_sha256(kdf_in, sizeof(kdf_in), block1, 0);
-        kdf_in[67] = 2;
-        mbedtls_sha256(kdf_in, sizeof(kdf_in), block2, 0);
-        /* Skip first 16 bytes (receipt key), return key_senc(16) || key_smac(16) || key_srmac(16) */
-        memcpy(res_APDU, block1 + 16, 16);
-        memcpy(res_APDU + 16, block2, 32);
-        res_APDU_size = 48;
-        mbedtls_platform_zeroize(kdf_in, sizeof(kdf_in));
-        return SW_OK();
     }
+    mbedtls_platform_zeroize(keys, sizeof(keys));
+    mbedtls_platform_zeroize(expected, sizeof(expected));
+    mbedtls_platform_zeroize(&cred, sizeof(cred));
+    if (ret != 0) return SW_SECURITY_STATUS_NOT_SATISFIED();
+    res_APDU_size = 48;
+    return SW_OK();
+}
+
+static int cmd_hsmauth_calculate(void) {
+    hsmauth_challenge_t pending = challenge;
+    hsmauth_clear_challenge(); /* Every attempt consumes state, even malformed requests. */
+    int ret = hsmauth_calculate(&pending);
+    mbedtls_platform_zeroize(&pending, sizeof(pending));
+    return ret;
 }
 
 static int cmd_hsmauth_reset(void) {
@@ -741,17 +823,22 @@ static int cmd_hsmauth_reset(void) {
     hsmauth_state_t st;
     hsmauth_default_state(&st);
     hsmauth_save_state(&st);
-    ephem_valid = false;
+    hsmauth_clear_challenge();
     return SW_OK();
 }
 
 static int hsmauth_unload(void) {
     apdu_clear_response_buffer();
-    ephem_valid = false;
+    hsmauth_clear_challenge();
     return PICOKEYS_OK;
 }
 
 static int hsmauth_process_apdu(void) {
+    if (INS(apdu) == HSMAUTH_INS_PUT || INS(apdu) == HSMAUTH_INS_DELETE ||
+        INS(apdu) == HSMAUTH_INS_CHANGE_CREDENTIAL_PASSWORD ||
+        INS(apdu) == HSMAUTH_INS_PUT_MANAGEMENT_KEY || INS(apdu) == HSMAUTH_INS_RESET) {
+        hsmauth_clear_challenge();
+    }
     if (!cap_supported(CAP_HSMAUTH)) {
         return SW_INS_NOT_SUPPORTED();
     }
@@ -778,6 +865,7 @@ static const uint8_t hsmauth_aid[] = {
 
 static int hsmauth_select(app_t *a, uint8_t force) {
     (void)force;
+    hsmauth_clear_challenge();
     if (!cap_supported(CAP_HSMAUTH)) {
         return PICOKEYS_ERR_FILE_NOT_FOUND;
     }
