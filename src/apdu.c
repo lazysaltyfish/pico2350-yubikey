@@ -43,6 +43,9 @@ void apdu_clear_response_buffer(void) {
     response_buffer = NULL;
     response_buffer_len = 0;
     response_buffer_app = NULL;
+    response_pending = false;
+    rdata_gr = NULL;
+    rdata_bk = 0;
 }
 
 void apdu_set_response_buffer(const uint8_t *data, uint16_t len) {
@@ -318,6 +321,7 @@ void *apdu_thread(void *arg) {
 
 #ifdef ENABLE_OTP_APP
         if (m == EV_OTP_CMD_AVAILABLE) {
+            apdu_clear_response_buffer();
             otp_hid_execute_pending();
             finished_data_size = 0;
             flag = EV_EXEC_FINISHED;

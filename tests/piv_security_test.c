@@ -30,6 +30,11 @@ static bool rng_failed;
 static uint8_t rng_block[16];
 static uint32_t rng_state = 1;
 static uint16_t fail_write_fid;
+static size_t io_events, fail_at_event;
+static bool fault_tripped, timeout_persists;
+static unsigned sync_events;
+static const uint8_t test_otp_root[32] = { 0x42 };
+const uint8_t *otp_key_1 = test_otp_root;
 
 typedef struct {
     file_t file;
@@ -38,6 +43,33 @@ typedef struct {
 } test_file_t;
 static test_file_t test_files[80];
 static size_t test_file_count;
+static test_file_t durable_files[80];
+static size_t durable_file_count;
+
+static void persist_files(void) {
+    memcpy(durable_files, test_files, sizeof(durable_files));
+    durable_file_count = test_file_count;
+}
+static bool io_allowed(bool sync) {
+    io_events++;
+    if (fault_tripped || (fail_at_event != 0 && io_events == fail_at_event)) {
+        if (sync && timeout_persists) persist_files();
+        fault_tripped = true;
+        return false;
+    }
+    return true;
+}
+static void reboot_fixture(void) {
+    memcpy(test_files, durable_files, sizeof(test_files));
+    test_file_count = durable_file_count;
+    for (size_t i = 0; i < test_file_count; i++) test_files[i].file.data = test_files[i].bytes;
+    piv_unload();
+    piv_txn = (applet_txn_t)APPLET_TXN_INITIALIZER(EF_PIV_TXN);
+    fail_write_fid = 0;
+    io_events = fail_at_event = 0;
+    fault_tripped = timeout_persists = false;
+    sync_events = 0;
+}
 
 uint16_t set_res_sw(uint8_t sw1, uint8_t sw2) {
     apdu.sw = ((uint16_t)sw1 << 8) | sw2;
@@ -108,6 +140,7 @@ bool file_has_data(const file_t *file) { return file && test_file(file)->size > 
 uint32_t file_get_size(const file_t *file) { return test_file(file)->size; }
 uint8_t *file_get_data(const file_t *file) { return test_file(file)->bytes; }
 int file_put_data(file_t *file, const_byte_array_t bytes) {
+    if (!io_allowed(false)) return PICOKEYS_ERR_MEMORY_FATAL;
     if (fail_write_fid != 0 && file->fid == fail_write_fid) {
         return PICOKEYS_ERR_MEMORY_FATAL;
     }
@@ -118,11 +151,25 @@ int file_put_data(file_t *file, const_byte_array_t bytes) {
     return PICOKEYS_OK;
 }
 int file_delete_no_commit(file_t *file) {
+    if (!io_allowed(false)) return PICOKEYS_ERR_MEMORY_FATAL;
     test_file(file)->size = 0;
     return PICOKEYS_OK;
 }
 int file_delete(file_t *file) { return file_delete_no_commit(file); }
 void flash_commit(void) {}
+bool flash_commit_sync(uint32_t timeout_ms) {
+    assert(timeout_ms > 0);
+    sync_events++;
+    if (!io_allowed(true)) return false;
+    persist_files();
+    return true;
+}
+int file_read_at(const file_t *file, uint32_t offset, byte_array_t bytes) {
+    test_file_t *entry = test_file(file);
+    if (offset > entry->size || bytes.len > entry->size - offset) return PICOKEYS_WRONG_LENGTH;
+    memcpy(bytes.data, entry->bytes + offset, bytes.len);
+    return PICOKEYS_OK;
+}
 
 /* Stand in for the device's encrypted-record adapter with real AES-GCM.
  * This fixture tests PIV handlers, rather than the separately tested adapter. */
@@ -195,8 +242,13 @@ static int authenticate(uint8_t alg, const uint8_t *inner, size_t len) {
 
 static void reset_empty(void) {
     memset(test_files, 0, sizeof(test_files));
-    test_file_count = 0;
+    memset(durable_files, 0, sizeof(durable_files));
+    test_file_count = durable_file_count = 0;
     piv_unload();
+    piv_txn = (applet_txn_t)APPLET_TXN_INITIALIZER(EF_PIV_TXN);
+    io_events = fail_at_event = 0;
+    fault_tripped = timeout_persists = false;
+    sync_events = 0;
     touch_allowed = true;
     touch_requests = 0;
     rng_failed = false;
@@ -671,9 +723,9 @@ static void test_fresh_policy_initialization(void) {
     fail_write_fid = EF_PIV_STATE;
     assert(command(INS_VERIFY, 0, PIV_PIN_P2, piv_default_pin, PIV_PIN_LEN) == 0x6581);
     assert_no_cached_grants();
-    assert(generate_p256(PIV_SLOT_AUTH) == 0x6581);
+    assert(generate_p256(PIV_SLOT_AUTH) == 0x6400);
     assert(!file_has_data(file_search(EF_PIV_KEY_BASE + piv_slot_index(PIV_SLOT_AUTH))));
-    fail_write_fid = 0;
+    reboot_fixture();
     assert(command(INS_VERIFY, 0, PIV_PIN_P2, piv_default_pin, PIV_PIN_LEN) == 0x9000);
 }
 
@@ -716,6 +768,238 @@ static void test_explicit_factory_reset(void) {
                              TAG_AUTH_CHALLENGE, digest, sizeof(digest)) == 0x6A86);
 }
 
+enum durable_operation { DURABLE_MOVE, DURABLE_RESET, DURABLE_ATTEST, DURABLE_OPERATION_COUNT };
+
+static void prepare_durable_operation(enum durable_operation operation) {
+    configure(PIV_ALG_AES128, aes128_key, PIV_TOUCH_POLICY_NEVER);
+    management_login();
+    assert(generate_p256(PIV_SLOT_AUTH) == 0x9000);
+    if (operation == DURABLE_RESET) {
+        assert(generate_p256(PIV_SLOT_ATTESTATION) == 0x9000);
+        assert(command(INS_PUT_DATA, 0x3F, 0xFF, test_piv_object, sizeof(test_piv_object)) == 0x9000);
+        piv_state_t state;
+        assert(piv_load_state(&state) == PICOKEYS_OK);
+        state.pin_retries = state.puk_retries = 0;
+        assert(piv_save_state(&state) == PICOKEYS_OK);
+        mbedtls_platform_zeroize(&state, sizeof(state));
+    }
+    io_events = 0;
+}
+
+static int execute_durable_operation(enum durable_operation operation) {
+    switch (operation) {
+        case DURABLE_MOVE: return command(INS_MOVE_KEY, PIV_SLOT_RETIRED_FIRST, PIV_SLOT_AUTH, NULL, 0);
+        case DURABLE_RESET: return command(INS_RESET, 0, 0, NULL, 0);
+        case DURABLE_ATTEST: return command(INS_ATTEST, PIV_SLOT_AUTH, 0, NULL, 0);
+        default: assert(!"unknown durable operation"); return 0;
+    }
+}
+
+static void assert_all_material_erased(void) {
+    for (uint16_t i = 0; i < PIV_SLOT_COUNT; i++) {
+        assert(!file_has_data(file_search((uint16_t)(EF_PIV_KEY_BASE + i))));
+    }
+    for (uint16_t i = 0; i < PIV_OBJECT_COUNT; i++) {
+        assert(!file_has_data(file_search((uint16_t)(EF_PIV_OBJ_BASE + i))));
+    }
+}
+
+static void check_reboot_consistency(enum durable_operation operation) {
+    reboot_fixture();
+    if (!applet_txn_ready(&piv_txn)) {
+        uint8_t digest[32] = { 1 };
+        assert(private_operation(PIV_SLOT_AUTH, PIV_ALG_ECCP256,
+                                 TAG_AUTH_CHALLENGE, digest, sizeof(digest)) == 0x6400);
+        assert(command(INS_VERIFY, 0, PIV_PIN_P2, piv_default_pin, PIV_PIN_LEN) == 0x6400);
+        assert(authenticate(PIV_ALG_3DES, start_single, sizeof(start_single)) == 0x6400);
+        assert(command(INS_RESET, 0, 0, NULL, 0) == 0x6400);
+        assert_no_cached_grants();
+        /* Recovery is explicitly destructive and cannot skip actual presence. */
+        touch_allowed = false;
+        size_t writes_before = io_events;
+        assert(command(INS_RESET, 0xDE, 0xAD, NULL, 0) == 0x6982);
+        assert(io_events == writes_before);
+        touch_allowed = true;
+        assert(command(INS_RESET, 0xDE, 0xAD, NULL, 0) == 0x9000);
+        assert_all_material_erased();
+        reboot_fixture();
+        assert(applet_txn_ready(&piv_txn));
+        assert_all_material_erased();
+        assert(command(INS_VERIFY, 0, PIV_PIN_P2, piv_default_pin, PIV_PIN_LEN) == 0x9000);
+        default_management_login();
+        return;
+    }
+    /* A clean marker permits only the complete old or complete new state. */
+    piv_state_t state;
+    assert(piv_load_state(&state) == PICOKEYS_OK);
+    bool source = file_has_data(file_search(EF_PIV_KEY_BASE + piv_slot_index(PIV_SLOT_AUTH)));
+    if (operation == DURABLE_MOVE) {
+        bool target = file_has_data(file_search(EF_PIV_KEY_BASE + piv_slot_index(PIV_SLOT_RETIRED_FIRST)));
+        assert(source != target);
+    }
+    else if (operation == DURABLE_RESET) {
+        bool f9 = file_has_data(file_search(EF_PIV_KEY_BASE + piv_slot_index(PIV_SLOT_ATTESTATION)));
+        bool object = file_has_data(file_search(EF_PIV_OBJ_BASE + piv_object_index(0x5FFF01u)));
+        if (state.mgm_type == PIV_ALG_3DES) {
+            assert_all_material_erased();
+            assert(state.pin_retries == 3 && state.puk_retries == 3);
+        }
+        else {
+            assert(source && f9 && object);
+            assert(state.pin_retries == 0 && state.puk_retries == 0);
+        }
+    }
+    else {
+        bool f9 = file_has_data(file_search(EF_PIV_KEY_BASE + piv_slot_index(PIV_SLOT_ATTESTATION)));
+        bool certificate = file_has_data(file_search(EF_PIV_OBJ_BASE + piv_object_index(0x5FFF01u)));
+        assert(source && f9 == certificate);
+    }
+    mbedtls_platform_zeroize(&state, sizeof(state));
+}
+
+static void test_multi_record_fault_matrix(void) {
+    for (enum durable_operation operation = DURABLE_MOVE; operation < DURABLE_OPERATION_COUNT; operation++) {
+        prepare_durable_operation(operation);
+        assert(execute_durable_operation(operation) == 0x9000);
+        size_t operation_events = io_events;
+        assert(operation_events >= 6);
+        check_reboot_consistency(operation);
+        for (unsigned ambiguous_timeout = 0; ambiguous_timeout < 2; ambiguous_timeout++) {
+            for (size_t failure = 1; failure <= operation_events; failure++) {
+                prepare_durable_operation(operation);
+                fail_at_event = failure;
+                timeout_persists = ambiguous_timeout != 0;
+                assert(execute_durable_operation(operation) == 0x6581);
+                assert(fault_tripped && piv_txn.faulted);
+                assert_no_cached_grants();
+                assert(command(INS_GET_VERSION, 0, 0, NULL, 0) == 0x6400);
+                check_reboot_consistency(operation);
+            }
+        }
+    }
+}
+
+enum state_operation {
+    STATE_VERIFY, STATE_WRONG_PIN, STATE_CHANGE_PIN, STATE_CHANGE_PUK,
+    STATE_RESET_PIN, STATE_RETRIES, STATE_MGM, STATE_IMPORT, STATE_PUT,
+    STATE_DELETE_OBJECT, STATE_DELETE_KEY, STATE_OPERATION_COUNT
+};
+
+static void prepare_state_operation(void) {
+    configure(PIV_ALG_AES128, aes128_key, PIV_TOUCH_POLICY_NEVER);
+    management_login();
+    assert(command(INS_VERIFY, 0, PIV_PIN_P2, piv_default_pin, PIV_PIN_LEN) == 0x9000);
+    assert(generate_p256(PIV_SLOT_AUTH) == 0x9000);
+    assert(command(INS_PUT_DATA, 0x3F, 0xFF, test_piv_object, sizeof(test_piv_object)) == 0x9000);
+    io_events = 0;
+}
+
+static int execute_state_operation(enum state_operation operation) {
+    uint8_t change[16];
+    uint8_t mgm[19] = { PIV_ALG_AES128, PIV_SLOT_CARD_MGM, 16 };
+    uint8_t imported[34] = { 0x06, 32 };
+    imported[33] = 1;
+    memcpy(change, operation == STATE_CHANGE_PUK || operation == STATE_RESET_PIN ? piv_default_puk : piv_default_pin, PIV_PIN_LEN);
+    memcpy(change + PIV_PIN_LEN, "654321\xFF\xFF", PIV_PIN_LEN);
+    switch (operation) {
+        case STATE_VERIFY: return command(INS_VERIFY, 0, PIV_PIN_P2, piv_default_pin, PIV_PIN_LEN);
+        case STATE_WRONG_PIN: return command(INS_VERIFY, 0, PIV_PIN_P2, change + PIV_PIN_LEN, PIV_PIN_LEN);
+        case STATE_CHANGE_PIN: return command(INS_CHANGE_REFERENCE, 0, PIV_PIN_P2, change, sizeof(change));
+        case STATE_CHANGE_PUK: return command(INS_CHANGE_REFERENCE, 0, PIV_PUK_P2, change, sizeof(change));
+        case STATE_RESET_PIN: return command(INS_RESET_RETRY, 0, PIV_PIN_P2, change, sizeof(change));
+        case STATE_RETRIES: return command(INS_SET_PIN_RETRIES, 4, 5, NULL, 0);
+        case STATE_MGM: return command(INS_SET_MGMKEY, 0xFF, 0xFF, mgm, sizeof(mgm));
+        case STATE_IMPORT: return command(INS_IMPORT_KEY, PIV_ALG_ECCP256, PIV_SLOT_CARD_AUTH, imported, sizeof(imported));
+        case STATE_PUT: return command(INS_PUT_DATA, 0x3F, 0xFF, test_piv_object, sizeof(test_piv_object));
+        case STATE_DELETE_OBJECT: {
+            const uint8_t object_id[] = { TAG_OBJ_ID, 3, 0x5F, 0xFF, 0x01, TAG_OBJ_DATA, 0 };
+            return command(INS_PUT_DATA, 0x3F, 0xFF, object_id, sizeof(object_id));
+        }
+        case STATE_DELETE_KEY: return command(INS_MOVE_KEY, 0xFF, PIV_SLOT_AUTH, NULL, 0);
+        default: assert(!"unknown state operation"); return 0;
+    }
+}
+
+static void test_single_record_fault_matrix(void) {
+    for (enum state_operation operation = STATE_VERIFY; operation < STATE_OPERATION_COUNT; operation++) {
+        prepare_state_operation();
+        assert(execute_state_operation(operation) == (operation == STATE_WRONG_PIN ? 0x63C2 : 0x9000));
+        size_t operation_events = io_events;
+        assert(operation_events >= 2 && sync_events > 0);
+        for (unsigned ambiguous_timeout = 0; ambiguous_timeout < 2; ambiguous_timeout++) {
+            for (size_t failure = 1; failure <= operation_events; failure++) {
+                prepare_state_operation();
+                fail_at_event = failure;
+                timeout_persists = ambiguous_timeout != 0;
+                assert(execute_state_operation(operation) == 0x6581);
+                assert(fault_tripped && piv_txn.faulted);
+                assert_no_cached_grants();
+                assert(command(INS_GET_VERSION, 0, 0, NULL, 0) == 0x6400);
+                reboot_fixture();
+                /* A single encrypted record may resolve to old or new data,
+                 * but a failed save never returned a PIN/authentication grant. */
+                piv_state_t state;
+                assert(piv_load_state(&state) == PICOKEYS_OK);
+                assert(state.pin_retries <= state.max_pin_retries);
+                assert(state.puk_retries <= state.max_puk_retries);
+                assert_no_cached_grants();
+            }
+        }
+    }
+}
+
+static void test_shared_transaction_marker_authentication(void) {
+    configure(PIV_ALG_AES128, aes128_key, PIV_TOUCH_POLICY_NEVER);
+    applet_txn_t txn = APPLET_TXN_INITIALIZER(EF_OPENPGP_TXN);
+    assert(applet_txn_ready(&txn));
+    assert(applet_txn_begin(&txn));
+    assert(applet_txn_ready(&txn));
+    assert(!applet_txn_begin(&txn));
+    applet_txn_t rebooted = APPLET_TXN_INITIALIZER(EF_OPENPGP_TXN);
+    assert(!applet_txn_ready(&rebooted)); /* Durable DIRTY intent. */
+    assert(applet_txn_commit(&txn));
+    rebooted = (applet_txn_t)APPLET_TXN_INITIALIZER(EF_OPENPGP_TXN);
+    assert(applet_txn_ready(&rebooted));
+    assert(!applet_txn_commit(&rebooted));
+    file_t *marker_file = file_search(EF_OPENPGP_TXN);
+    uint8_t encoded[64];
+    size_t encoded_len = file_get_size(marker_file);
+    assert(encoded_len < sizeof(encoded));
+    memcpy(encoded, file_get_data(marker_file), encoded_len);
+    /* Copying another applet's clean marker must not authenticate. */
+    file_t *other = file_new(EF_HSMAUTH_TXN);
+    assert(file_put_data(other, CONST_BYTE_ARRAY(encoded, encoded_len)) == PICOKEYS_OK);
+    applet_txn_t other_txn = APPLET_TXN_INITIALIZER(EF_HSMAUTH_TXN);
+    assert(!applet_txn_ready(&other_txn));
+    test_file(marker_file)->bytes[encoded_len - 1] ^= 1;
+    rebooted = (applet_txn_t)APPLET_TXN_INITIALIZER(EF_OPENPGP_TXN);
+    assert(!applet_txn_ready(&rebooted));
+    /* The explicitly authorized recovery primitive reasserts DIRTY first. */
+    assert(applet_txn_recover_begin(&rebooted));
+    assert(applet_txn_commit(&rebooted));
+    test_file(marker_file)->size--;
+    rebooted = (applet_txn_t)APPLET_TXN_INITIALIZER(EF_OPENPGP_TXN);
+    assert(!applet_txn_ready(&rebooted));
+}
+
+static void test_interrupted_recovery_remains_locked(void) {
+    prepare_durable_operation(DURABLE_MOVE);
+    assert(applet_txn_begin(&piv_txn));
+    reboot_fixture();
+    assert(!applet_txn_ready(&piv_txn));
+    touch_allowed = true;
+    io_events = 0;
+    /* Fail the first recovery data deletion after durable intent. */
+    fail_write_fid = EF_PIV_STATE;
+    assert(command(INS_RESET, 0xDE, 0xAD, NULL, 0) == 0x6581);
+    assert(piv_txn.faulted);
+    reboot_fixture();
+    assert(!applet_txn_ready(&piv_txn));
+    assert(command(INS_VERIFY, 0, PIV_PIN_P2, piv_default_pin, PIV_PIN_LEN) == 0x6400);
+    assert(command(INS_RESET, 0xDE, 0xAD, NULL, 0) == 0x9000);
+    assert_all_material_erased();
+}
+
 int main(void) {
     test_valid_handshakes();
     test_mixing_and_touch();
@@ -724,6 +1008,10 @@ int main(void) {
     test_corrupt_policy_fails_closed();
     test_fresh_policy_initialization();
     test_explicit_factory_reset();
+    test_shared_transaction_marker_authentication();
+    test_multi_record_fault_matrix();
+    test_single_record_fault_matrix();
+    test_interrupted_recovery_remains_locked();
     puts("PIV security regression tests passed");
     return 0;
 }

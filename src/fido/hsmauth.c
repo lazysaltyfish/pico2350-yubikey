@@ -24,6 +24,7 @@
 #include "apdu.h"
 #include "files.h"
 #include "applet_storage.h"
+#include "applet_txn.h"
 #include "random.h"
 #include "crypto_utils.h"
 #include "management.h"
@@ -152,15 +153,33 @@ static void hsmauth_default_state(hsmauth_state_t *st) {
     st->mgm_retries = HSMAUTH_INITIAL_RETRIES;
 }
 
+static applet_txn_t hsmauth_txn = APPLET_TXN_INITIALIZER(EF_HSMAUTH_TXN);
+
+static bool hsmauth_record_save(uint16_t fid, const void *data, size_t len) {
+    bool ok = applet_txn_ready(&hsmauth_txn) && applet_storage_save(fid, data, len) && flash_commit_sync(5000);
+    if (!ok) applet_txn_fail(&hsmauth_txn);
+    return ok;
+}
+
+static bool hsmauth_record_delete(file_t *ef) {
+    bool ok = file_delete_no_commit(ef) == PICOKEYS_OK && flash_commit_sync(5000);
+    if (!ok) applet_txn_fail(&hsmauth_txn);
+    return ok;
+}
+
 static bool hsmauth_save_state(const hsmauth_state_t *st) {
-    return applet_storage_save(EF_HSMAUTH_STATE, st, sizeof(*st));
+    return hsmauth_record_save(EF_HSMAUTH_STATE, st, sizeof(*st));
 }
 
 static bool hsmauth_load_state(hsmauth_state_t *st) {
+    memset(st, 0, sizeof(*st));
+    if (!applet_txn_ready(&hsmauth_txn)) return false;
     file_t *ef = file_search(EF_HSMAUTH_STATE);
     if (ef && file_has_data(ef)) {
-        return applet_storage_load(EF_HSMAUTH_STATE, st, sizeof(*st)) &&
-               st->magic == HSMAUTH_STATE_MAGIC && st->mgm_retries <= HSMAUTH_INITIAL_RETRIES;
+        bool ok = applet_storage_load(EF_HSMAUTH_STATE, st, sizeof(*st)) &&
+                  st->magic == HSMAUTH_STATE_MAGIC && st->mgm_retries <= HSMAUTH_INITIAL_RETRIES;
+        if (!ok) mbedtls_platform_zeroize(st, sizeof(*st));
+        return ok;
     }
     /* Missing authentication state must never grant default access to
      * credentials that survived an incomplete erase or legacy upgrade. */
@@ -188,7 +207,7 @@ static bool hsmauth_save_cred(uint8_t idx, const hsmauth_cred_t *cred) {
     stored.magic = HSMAUTH_STATE_MAGIC;
     memset(stored.iv, 0, sizeof(stored.iv));
     memset(stored.tag, 0, sizeof(stored.tag));
-    bool ok = applet_storage_save((uint16_t)(EF_HSMAUTH_CRED_BASE + idx), &stored, sizeof(stored));
+    bool ok = hsmauth_record_save((uint16_t)(EF_HSMAUTH_CRED_BASE + idx), &stored, sizeof(stored));
     mbedtls_platform_zeroize(&stored, sizeof(stored));
     return ok;
 }
@@ -243,31 +262,25 @@ static bool hsmauth_next_tlv(const uint8_t *buf, size_t buf_len, size_t *pos, ui
 static int hsmauth_verify_mgm(hsmauth_state_t *st, const uint8_t *mgm, size_t mgm_len) {
     if (!mgm || mgm_len != 16) return SW_WRONG_DATA();
     if (st->mgm_retries == 0) return SW_PIN_BLOCKED();
-    if (mbedtls_ct_memcmp(st->mgm_key, mgm, 16) == 0) {
-        if (st->mgm_retries != HSMAUTH_INITIAL_RETRIES) {
-            st->mgm_retries = HSMAUTH_INITIAL_RETRIES;
-            hsmauth_save_state(st);
-        }
-        return SW_OK();
-    }
     st->mgm_retries--;
-    hsmauth_save_state(st);
-    return set_res_sw(0x63, (uint8_t)(0xC0 | (st->mgm_retries & 0x0F)));
+    if (!hsmauth_save_state(st)) return SW_MEMORY_FAILURE();
+    /* Persist the attempt before comparing, so cutting power cannot undo a
+     * guess whose correctness might be inferred from later processing. */
+    if (mbedtls_ct_memcmp(st->mgm_key, mgm, 16) != 0)
+        return set_res_sw(0x63, (uint8_t)(0xC0 | st->mgm_retries));
+    st->mgm_retries = HSMAUTH_INITIAL_RETRIES;
+    return hsmauth_save_state(st) ? SW_OK() : SW_MEMORY_FAILURE();
 }
 
 static int hsmauth_verify_cred_pw(uint8_t slot, hsmauth_cred_t *cred, const uint8_t *pw, size_t pw_len) {
     if (!pw || pw_len != 16) return SW_WRONG_DATA();
     if (cred->retries == 0) return SW_PIN_BLOCKED();
-    if (mbedtls_ct_memcmp(cred->cred_pw, pw, 16) == 0) {
-        if (cred->retries != HSMAUTH_INITIAL_RETRIES) {
-            cred->retries = HSMAUTH_INITIAL_RETRIES;
-            hsmauth_save_cred(slot, cred);
-        }
-        return SW_OK();
-    }
     cred->retries--;
-    hsmauth_save_cred(slot, cred);
-    return set_res_sw(0x63, (uint8_t)(0xC0 | (cred->retries & 0x0F)));
+    if (!hsmauth_save_cred(slot, cred)) return SW_MEMORY_FAILURE();
+    if (mbedtls_ct_memcmp(cred->cred_pw, pw, 16) != 0)
+        return set_res_sw(0x63, (uint8_t)(0xC0 | cred->retries));
+    cred->retries = HSMAUTH_INITIAL_RETRIES;
+    return hsmauth_save_cred(slot, cred) ? SW_OK() : SW_MEMORY_FAILURE();
 }
 
 static int hsmauth_scp03_kdf(const uint8_t key[16], uint8_t deriv_const, uint16_t out_bits,
@@ -319,7 +332,7 @@ static int cmd_hsmauth_put_mgm_key(void) {
     if (rc != SW_OK()) return rc;
     memcpy(st.mgm_key, new_mgm, 16);
     st.mgm_retries = HSMAUTH_INITIAL_RETRIES;
-    hsmauth_save_state(&st);
+    if (!hsmauth_save_state(&st)) return SW_MEMORY_FAILURE();
     return SW_OK();
 }
 
@@ -377,6 +390,7 @@ static int cmd_hsmauth_put(void) {
     }
     hsmauth_state_t st;
     if (!hsmauth_load_state(&st)) return SW_EXEC_ERROR();
+    if (!applet_txn_begin(&hsmauth_txn)) return SW_MEMORY_FAILURE();
     int rc = hsmauth_verify_mgm(&st, mgm, 16);
     if (rc != SW_OK()) return rc;
 
@@ -472,6 +486,7 @@ static int cmd_hsmauth_delete(void) {
     if (!mgm || !label || label_len < 1 || label_len > 64) return SW_WRONG_DATA();
     hsmauth_state_t st;
     if (!hsmauth_load_state(&st)) return SW_EXEC_ERROR();
+    if (!applet_txn_begin(&hsmauth_txn)) return SW_MEMORY_FAILURE();
     int rc = hsmauth_verify_mgm(&st, mgm, 16);
     if (rc != SW_OK()) return rc;
 
@@ -479,8 +494,7 @@ static int cmd_hsmauth_delete(void) {
     if (slot < 0) return SW_FILE_NOT_FOUND();
     file_t *ef = file_search((uint16_t)(EF_HSMAUTH_CRED_BASE + slot));
     if (ef && file_has_data(ef)) {
-        file_delete(ef);
-        flash_commit();
+        if (!hsmauth_record_delete(ef)) return SW_MEMORY_FAILURE();
     }
     return SW_OK();
 }
@@ -521,7 +535,10 @@ static int cmd_hsmauth_change_cred_password(void) {
         }
         memcpy(cred.cred_pw, pw2, 16);
         cred.retries = HSMAUTH_INITIAL_RETRIES;
-        hsmauth_save_cred((uint8_t)slot, &cred);
+        if (!hsmauth_save_cred((uint8_t)slot, &cred)) {
+            mbedtls_platform_zeroize(&cred, sizeof(cred));
+            return SW_MEMORY_FAILURE();
+        }
     }
     else {
         if (!mgm || !pw1) {
@@ -530,6 +547,10 @@ static int cmd_hsmauth_change_cred_password(void) {
         }
         hsmauth_state_t st;
         if (!hsmauth_load_state(&st)) return SW_EXEC_ERROR();
+        if (!applet_txn_begin(&hsmauth_txn)) {
+            mbedtls_platform_zeroize(&cred, sizeof(cred));
+            return SW_MEMORY_FAILURE();
+        }
         int rc = hsmauth_verify_mgm(&st, mgm, 16);
         if (rc != SW_OK()) {
             mbedtls_platform_zeroize(&cred, sizeof(cred));
@@ -537,7 +558,10 @@ static int cmd_hsmauth_change_cred_password(void) {
         }
         memcpy(cred.cred_pw, pw1, 16);
         cred.retries = HSMAUTH_INITIAL_RETRIES;
-        hsmauth_save_cred((uint8_t)slot, &cred);
+        if (!hsmauth_save_cred((uint8_t)slot, &cred)) {
+            mbedtls_platform_zeroize(&cred, sizeof(cred));
+            return SW_MEMORY_FAILURE();
+        }
     }
     mbedtls_platform_zeroize(&cred, sizeof(cred));
     return SW_OK();
@@ -763,15 +787,16 @@ static int cmd_hsmauth_reset(void) {
     if (timeout_s == 0) timeout_s = 15;
     if (wait_button_pressed_timeout(timeout_s) != 0) return SW_SECURITY_STATUS_NOT_SATISFIED();
 #endif
+    if (!applet_txn_recover_begin(&hsmauth_txn)) return SW_MEMORY_FAILURE();
     for (uint8_t i = 0; i < HSMAUTH_MAX_CREDS; i++) {
         file_t *ef = file_search((uint16_t)(EF_HSMAUTH_CRED_BASE + i));
-        if (ef && file_has_data(ef) && file_delete_no_commit(ef) != PICOKEYS_OK) return SW_MEMORY_FAILURE();
+        if (ef && file_has_data(ef) && !hsmauth_record_delete(ef)) return SW_MEMORY_FAILURE();
     }
     hsmauth_state_t st;
     hsmauth_default_state(&st);
     if (!hsmauth_save_state(&st)) return SW_MEMORY_FAILURE();
     hsmauth_clear_challenge();
-    return SW_OK();
+    return applet_txn_commit(&hsmauth_txn) ? SW_OK() : SW_MEMORY_FAILURE();
 }
 
 static int hsmauth_unload(void) {
@@ -780,21 +805,7 @@ static int hsmauth_unload(void) {
     return PICOKEYS_OK;
 }
 
-static int hsmauth_process_apdu(void) {
-    if (INS(apdu) == HSMAUTH_INS_PUT || INS(apdu) == HSMAUTH_INS_DELETE ||
-        INS(apdu) == HSMAUTH_INS_CHANGE_CREDENTIAL_PASSWORD ||
-        INS(apdu) == HSMAUTH_INS_PUT_MANAGEMENT_KEY || INS(apdu) == HSMAUTH_INS_RESET) {
-        hsmauth_clear_challenge();
-    }
-    if (!cap_supported(CAP_HSMAUTH)) {
-        return SW_INS_NOT_SUPPORTED();
-    }
-    hsmauth_state_t state;
-    if (INS(apdu) != HSMAUTH_INS_RESET && !hsmauth_load_state(&state)) {
-        hsmauth_clear_challenge();
-        return SW_EXEC_ERROR();
-    }
-    mbedtls_platform_zeroize(&state, sizeof(state));
+static int hsmauth_dispatch(void) {
     switch (INS(apdu)) {
         case HSMAUTH_INS_PUT:                        return cmd_hsmauth_put();
         case HSMAUTH_INS_DELETE:                     return cmd_hsmauth_delete();
@@ -809,6 +820,30 @@ static int hsmauth_process_apdu(void) {
         case HSMAUTH_INS_CHANGE_CREDENTIAL_PASSWORD: return cmd_hsmauth_change_cred_password();
         default:                                     return SW_INS_NOT_SUPPORTED();
     }
+}
+
+static int hsmauth_process_apdu(void) {
+    uint8_t ins = INS(apdu);
+    if (ins == HSMAUTH_INS_PUT || ins == HSMAUTH_INS_DELETE ||
+        ins == HSMAUTH_INS_CHANGE_CREDENTIAL_PASSWORD ||
+        ins == HSMAUTH_INS_PUT_MANAGEMENT_KEY || ins == HSMAUTH_INS_RESET) {
+        hsmauth_clear_challenge();
+    }
+    if (!cap_supported(CAP_HSMAUTH)) return SW_INS_NOT_SUPPORTED();
+    if (ins == HSMAUTH_INS_RESET) return cmd_hsmauth_reset();
+    hsmauth_state_t state;
+    if (!hsmauth_load_state(&state)) {
+        hsmauth_unload();
+        return SW_EXEC_ERROR();
+    }
+    mbedtls_platform_zeroize(&state, sizeof(state));
+    int ret = hsmauth_dispatch();
+    if ((hsmauth_txn.active && !applet_txn_commit(&hsmauth_txn)) || hsmauth_txn.faulted) {
+        mbedtls_platform_zeroize(res_APDU, res_APDU_size);
+        hsmauth_unload();
+        return SW_MEMORY_FAILURE();
+    }
+    return ret;
 }
 
 static const uint8_t hsmauth_aid[] = {

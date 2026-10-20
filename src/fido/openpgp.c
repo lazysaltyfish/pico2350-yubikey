@@ -24,6 +24,7 @@
 #include "apdu.h"
 #include "files.h"
 #include "applet_storage.h"
+#include "applet_txn.h"
 #include "random.h"
 #include "serial.h"
 #include "crypto_utils.h"
@@ -45,6 +46,7 @@
 #include "mbedtls/sha256.h"
 #include "mbedtls/sha512.h"
 #include "mbedtls/gcm.h"
+#include "mbedtls/constant_time.h"
 #include "mbedtls/platform_util.h"
 
 /* OpenPGP INS codes */
@@ -268,22 +270,40 @@ static void opgp_default_state(opgp_state_t *st) {
     st->kdf_len = 3;
 }
 
+static applet_txn_t opgp_txn = APPLET_TXN_INITIALIZER(EF_OPENPGP_TXN);
+
+static bool opgp_record_save(uint16_t fid, const void *data, size_t len) {
+    bool ok = applet_txn_ready(&opgp_txn) && applet_storage_save(fid, data, len) && flash_commit_sync(5000);
+    if (!ok) applet_txn_fail(&opgp_txn);
+    return ok;
+}
+
+static bool opgp_record_delete(file_t *ef) {
+    bool ok = file_delete_no_commit(ef) == PICOKEYS_OK && flash_commit_sync(5000);
+    if (!ok) applet_txn_fail(&opgp_txn);
+    return ok;
+}
+
 static bool opgp_save_state(const opgp_state_t *st) {
-    return applet_storage_save(EF_OPENPGP_STATE, st, sizeof(*st));
+    return opgp_record_save(EF_OPENPGP_STATE, st, sizeof(*st));
 }
 
 static bool opgp_load_state(opgp_state_t *st) {
+    memset(st, 0, sizeof(*st));
+    if (!applet_txn_ready(&opgp_txn)) return false;
     file_t *ef = file_search(EF_OPENPGP_STATE);
     if (ef && file_has_data(ef)) {
-        if (!applet_storage_load(EF_OPENPGP_STATE, st, sizeof(*st)) || st->magic != OPGP_STATE_MAGIC) return false;
-        if (st->name_len > sizeof(st->name) || st->lang_len > sizeof(st->lang) ||
-            st->login_len > sizeof(st->login) || st->url_len > sizeof(st->url) ||
-            st->kdf_len > sizeof(st->kdf_data) || st->pw1_retries > st->pw1_max_retries ||
-            st->pw3_retries > st->pw3_max_retries || st->rc_retries > st->rc_max_retries) return false;
-        for (size_t i = 0; i < OPGP_NUM_SLOTS; i++) {
-            if (st->alg_attr_len[i] > sizeof(st->alg_attr[i]) || st->uif[i][0] > OPGP_UIF_CACHED_FIXED) return false;
+        bool valid = applet_storage_load(EF_OPENPGP_STATE, st, sizeof(*st)) &&
+                     st->magic == OPGP_STATE_MAGIC &&
+                     st->name_len <= sizeof(st->name) && st->lang_len <= sizeof(st->lang) &&
+                     st->login_len <= sizeof(st->login) && st->url_len <= sizeof(st->url) &&
+                     st->kdf_len <= sizeof(st->kdf_data) && st->pw1_retries <= st->pw1_max_retries &&
+                     st->pw3_retries <= st->pw3_max_retries && st->rc_retries <= st->rc_max_retries;
+        for (size_t i = 0; valid && i < OPGP_NUM_SLOTS; i++) {
+            valid = st->alg_attr_len[i] <= sizeof(st->alg_attr[i]) && st->uif[i][0] <= OPGP_UIF_CACHED_FIXED;
         }
-        return true;
+        if (!valid) mbedtls_platform_zeroize(st, sizeof(*st));
+        return valid;
     }
     /* Defaults are safe only for a completely empty applet. */
     for (uint16_t i = 0; i < OPGP_NUM_SLOTS; i++) {
@@ -420,7 +440,7 @@ static int opgp_store_key_record(uint8_t slot, uint8_t alg_id, uint8_t grp_id, u
     memcpy(record, &hdr, sizeof(hdr));
     if (pub_len) memcpy(record + sizeof(hdr), pub, pub_len);
     if (priv_len) memcpy(record + sizeof(hdr) + pub_len, priv, priv_len);
-    bool ok = applet_storage_save((uint16_t)(EF_OPENPGP_KEY_BASE + slot), record,
+    bool ok = opgp_record_save((uint16_t)(EF_OPENPGP_KEY_BASE + slot), record,
                                   sizeof(hdr) + pub_len + priv_len);
     mbedtls_platform_zeroize(record, sizeof(record));
     return ok ? 0 : -1;
@@ -459,14 +479,14 @@ static int opgp_get_stored_data(uint16_t fid, size_t limit) {
     return SW_OK();
 }
 
-static void opgp_delete_slot_key(opgp_state_t *st, uint8_t slot) {
+static bool opgp_delete_slot_key(opgp_state_t *st, uint8_t slot) {
     if (slot >= OPGP_NUM_SLOTS) {
-        return;
+        return false;
     }
     uint16_t fid = (uint16_t)(EF_OPENPGP_KEY_BASE + slot);
     file_t *ef = file_search(fid);
     if (ef && file_has_data(ef)) {
-        file_delete_no_commit(ef);
+        if (!opgp_record_delete(ef)) return false;
     }
     st->key_status[slot] = OPGP_KEY_STATUS_NONE;
     memset(st->fp[slot], 0, 20);
@@ -474,21 +494,22 @@ static void opgp_delete_slot_key(opgp_state_t *st, uint8_t slot) {
     if (slot == OPGP_SLOT_SIG) {
         st->sig_counter = 0;
     }
+    return true;
 }
 
 static bool opgp_factory_reset(void) {
     for (uint8_t s = 0; s < OPGP_NUM_SLOTS; s++) {
         file_t *ef = file_search((uint16_t)(EF_OPENPGP_KEY_BASE + s));
         if (ef && file_has_data(ef)) {
-            if (file_delete_no_commit(ef) != PICOKEYS_OK) return false;
+            if (!opgp_record_delete(ef)) return false;
         }
         ef = file_search((uint16_t)(EF_OPENPGP_CERT_BASE + s));
         if (ef && file_has_data(ef)) {
-            if (file_delete_no_commit(ef) != PICOKEYS_OK) return false;
+            if (!opgp_record_delete(ef)) return false;
         }
         ef = file_search((uint16_t)(EF_OPENPGP_PRIV_DO_BASE + s));
         if (ef && file_has_data(ef)) {
-            if (file_delete_no_commit(ef) != PICOKEYS_OK) return false;
+            if (!opgp_record_delete(ef)) return false;
         }
     }
     static opgp_state_t st;
@@ -862,36 +883,36 @@ static int cmd_opgp_put_data(void) {
             if (apdu.nc > 39) return SW_WRONG_LENGTH();
             memcpy(st.name, apdu.data, apdu.nc);
             st.name_len = (uint8_t)apdu.nc;
-            opgp_save_state(&st);
+            if (!opgp_save_state(&st)) return SW_MEMORY_FAILURE();
             return SW_OK();
         case 0x5F2D:
             if (apdu.nc > 8) return SW_WRONG_LENGTH();
             memcpy(st.lang, apdu.data, apdu.nc);
             st.lang_len = (uint8_t)apdu.nc;
-            opgp_save_state(&st);
+            if (!opgp_save_state(&st)) return SW_MEMORY_FAILURE();
             return SW_OK();
         case 0x5F35:
             if (apdu.nc != 1) return SW_WRONG_LENGTH();
             st.sex = apdu.data[0];
-            opgp_save_state(&st);
+            if (!opgp_save_state(&st)) return SW_MEMORY_FAILURE();
             return SW_OK();
         case 0x005E:
             if (apdu.nc > sizeof(st.login)) return SW_WRONG_LENGTH();
             memcpy(st.login, apdu.data, apdu.nc);
             st.login_len = (uint8_t)apdu.nc;
-            opgp_save_state(&st);
+            if (!opgp_save_state(&st)) return SW_MEMORY_FAILURE();
             return SW_OK();
         case 0x5F50:
             if (apdu.nc > sizeof(st.url)) return SW_WRONG_LENGTH();
             memcpy(st.url, apdu.data, apdu.nc);
             st.url_len = (uint8_t)apdu.nc;
-            opgp_save_state(&st);
+            if (!opgp_save_state(&st)) return SW_MEMORY_FAILURE();
             return SW_OK();
         case 0x00C4:
             if (apdu.nc != 1 && apdu.nc != 7) return SW_WRONG_LENGTH();
             if (apdu.data[0] > 1) return SW_WRONG_DATA();
             st.pw1_policy = apdu.data[0];
-            opgp_save_state(&st);
+            if (!opgp_save_state(&st)) return SW_MEMORY_FAILURE();
             return SW_OK();
         case 0x00C1:
         case 0x00C2:
@@ -901,10 +922,11 @@ static int cmd_opgp_put_data(void) {
             if (!opgp_validate_alg_attr(s, apdu.data, apdu.nc)) {
                 return SW_WRONG_DATA();
             }
-            opgp_delete_slot_key(&st, s);
+            if (!opgp_txn.active && !applet_txn_begin(&opgp_txn)) return SW_MEMORY_FAILURE();
+            if (!opgp_delete_slot_key(&st, s)) return SW_MEMORY_FAILURE();
             memcpy(st.alg_attr[s], apdu.data, apdu.nc);
             st.alg_attr_len[s] = (uint8_t)apdu.nc;
-            opgp_save_state(&st);
+            if (!opgp_save_state(&st)) return SW_MEMORY_FAILURE();
             return SW_OK();
         }
         case 0x00C7:
@@ -915,7 +937,7 @@ static int cmd_opgp_put_data(void) {
             uint8_t s = (tag == 0x00DB) ? OPGP_SLOT_ATT : (uint8_t)(tag - 0x00C7);
             if (apdu.nc == 20) memcpy(st.fp[s], apdu.data, 20);
             else memset(st.fp[s], 0, 20);
-            opgp_save_state(&st);
+            if (!opgp_save_state(&st)) return SW_MEMORY_FAILURE();
             return SW_OK();
         }
         case 0x00CA:
@@ -926,7 +948,7 @@ static int cmd_opgp_put_data(void) {
             uint8_t s = (tag == 0x00DC) ? OPGP_SLOT_ATT : (uint8_t)(tag - 0x00CA);
             if (apdu.nc == 20) memcpy(st.ca_fp[s], apdu.data, 20);
             else memset(st.ca_fp[s], 0, 20);
-            opgp_save_state(&st);
+            if (!opgp_save_state(&st)) return SW_MEMORY_FAILURE();
             return SW_OK();
         }
         case 0x00CE:
@@ -942,7 +964,7 @@ static int cmd_opgp_put_data(void) {
             else {
                 st.gen_time[s] = 0;
             }
-            opgp_save_state(&st);
+            if (!opgp_save_state(&st)) return SW_MEMORY_FAILURE();
             return SW_OK();
         }
         case 0x00D3: {
@@ -959,7 +981,7 @@ static int cmd_opgp_put_data(void) {
                 st.rc_len = (uint8_t)apdu.nc;
                 st.rc_retries = st.rc_max_retries;
             }
-            opgp_save_state(&st);
+            if (!opgp_save_state(&st)) return SW_MEMORY_FAILURE();
             return SW_OK();
         }
         case 0x00D6:
@@ -977,7 +999,7 @@ static int cmd_opgp_put_data(void) {
             }
             st.uif[s][0] = apdu.data[0];
             st.uif[s][1] = 0x20;
-            opgp_save_state(&st);
+            if (!opgp_save_state(&st)) return SW_MEMORY_FAILURE();
             return SW_OK();
         }
         case 0x00F9: {
@@ -1020,7 +1042,7 @@ static int cmd_opgp_put_data(void) {
             st.pw3_retries = st.pw3_max_retries;
             st.rc_len = 0;
             st.rc_retries = 0;
-            opgp_save_state(&st);
+            if (!opgp_save_state(&st)) return SW_MEMORY_FAILURE();
             return SW_OK();
         }
         case 0x7F21:
@@ -1037,12 +1059,11 @@ static int cmd_opgp_put_data(void) {
             file_t *ef = file_search(fid);
             if (apdu.nc == 0) {
                 if (ef && file_has_data(ef)) {
-                    file_delete(ef);
-                    flash_commit();
+                    if (!opgp_record_delete(ef)) return SW_MEMORY_FAILURE();
                 }
             }
             else {
-                if (!applet_storage_save(fid, apdu.data, apdu.nc)) return SW_MEMORY_FAILURE();
+                if (!opgp_record_save(fid, apdu.data, apdu.nc)) return SW_MEMORY_FAILURE();
             }
             return SW_OK();
         }
@@ -1056,12 +1077,11 @@ static int cmd_opgp_put_data(void) {
             file_t *ef = file_search(fid);
             if (apdu.nc == 0) {
                 if (ef && file_has_data(ef)) {
-                    file_delete(ef);
-                    flash_commit();
+                    if (!opgp_record_delete(ef)) return SW_MEMORY_FAILURE();
                 }
             }
             else {
-                if (!applet_storage_save(fid, apdu.data, apdu.nc)) return SW_MEMORY_FAILURE();
+                if (!opgp_record_save(fid, apdu.data, apdu.nc)) return SW_MEMORY_FAILURE();
             }
             return SW_OK();
         }
@@ -1103,17 +1123,17 @@ static int cmd_opgp_verify(void) {
         if (st.pw1_retries == 0) {
             return SW_PIN_BLOCKED();
         }
-        if (apdu.nc == st.pw1_len && memcmp(h, st.pw1_hash, 32) == 0) {
+        st.pw1_retries--;
+        if (!opgp_save_state(&st)) return SW_MEMORY_FAILURE();
+        if (apdu.nc == st.pw1_len && mbedtls_ct_memcmp(h, st.pw1_hash, 32) == 0) {
             if (st.pw1_retries != st.pw1_max_retries) {
                 st.pw1_retries = st.pw1_max_retries;
-                opgp_save_state(&st);
+                if (!opgp_save_state(&st)) return SW_MEMORY_FAILURE();
             }
             if (p2 == 0x81) pw1_81_verified = true;
             else pw1_82_verified = true;
             return SW_OK();
         }
-        st.pw1_retries--;
-        opgp_save_state(&st);
         pw1_81_verified = false;
         pw1_82_verified = false;
         return SW_SECURITY_STATUS_NOT_SATISFIED();
@@ -1122,16 +1142,16 @@ static int cmd_opgp_verify(void) {
         if (st.pw3_retries == 0) {
             return SW_PIN_BLOCKED();
         }
-        if (apdu.nc == st.pw3_len && memcmp(h, st.pw3_hash, 32) == 0) {
+        st.pw3_retries--;
+        if (!opgp_save_state(&st)) return SW_MEMORY_FAILURE();
+        if (apdu.nc == st.pw3_len && mbedtls_ct_memcmp(h, st.pw3_hash, 32) == 0) {
             if (st.pw3_retries != st.pw3_max_retries) {
                 st.pw3_retries = st.pw3_max_retries;
-                opgp_save_state(&st);
+                if (!opgp_save_state(&st)) return SW_MEMORY_FAILURE();
             }
             pw3_verified = true;
             return SW_OK();
         }
-        st.pw3_retries--;
-        opgp_save_state(&st);
         pw3_verified = false;
         return SW_SECURITY_STATUS_NOT_SATISFIED();
     }
@@ -1157,9 +1177,9 @@ static int cmd_opgp_change_pin(void) {
 
     if (p2 == 0x81) {
         if (st.pw1_retries == 0) return SW_PIN_BLOCKED();
-        if (memcmp(h_old, st.pw1_hash, 32) != 0) {
-            st.pw1_retries--;
-            opgp_save_state(&st);
+        st.pw1_retries--;
+        if (!opgp_save_state(&st)) return SW_MEMORY_FAILURE();
+        if (mbedtls_ct_memcmp(h_old, st.pw1_hash, 32) != 0) {
             pw1_81_verified = false;
             pw1_82_verified = false;
             return SW_SECURITY_STATUS_NOT_SATISFIED();
@@ -1167,21 +1187,21 @@ static int cmd_opgp_change_pin(void) {
         opgp_sha256(apdu.data + old_len, apdu.nc - old_len, st.pw1_hash);
         st.pw1_len = (uint8_t)(apdu.nc - old_len);
         st.pw1_retries = st.pw1_max_retries;
-        opgp_save_state(&st);
+        if (!opgp_save_state(&st)) return SW_MEMORY_FAILURE();
         return SW_OK();
     }
     else {
         if (st.pw3_retries == 0) return SW_PIN_BLOCKED();
-        if (memcmp(h_old, st.pw3_hash, 32) != 0) {
-            st.pw3_retries--;
-            opgp_save_state(&st);
+        st.pw3_retries--;
+        if (!opgp_save_state(&st)) return SW_MEMORY_FAILURE();
+        if (mbedtls_ct_memcmp(h_old, st.pw3_hash, 32) != 0) {
             pw3_verified = false;
             return SW_SECURITY_STATUS_NOT_SATISFIED();
         }
         opgp_sha256(apdu.data + old_len, apdu.nc - old_len, st.pw3_hash);
         st.pw3_len = (uint8_t)(apdu.nc - old_len);
         st.pw3_retries = st.pw3_max_retries;
-        opgp_save_state(&st);
+        if (!opgp_save_state(&st)) return SW_MEMORY_FAILURE();
         return SW_OK();
     }
 }
@@ -1205,7 +1225,7 @@ static int cmd_opgp_reset_retry_counter(void) {
         opgp_sha256(apdu.data, apdu.nc, st.pw1_hash);
         st.pw1_len = (uint8_t)apdu.nc;
         st.pw1_retries = st.pw1_max_retries;
-        opgp_save_state(&st);
+        if (!opgp_save_state(&st)) return SW_MEMORY_FAILURE();
         return SW_OK();
     }
     else {
@@ -1217,16 +1237,16 @@ static int cmd_opgp_reset_retry_counter(void) {
         }
         uint8_t h_rc[32];
         opgp_sha256(apdu.data, st.rc_len, h_rc);
-        if (memcmp(h_rc, st.rc_hash, 32) != 0) {
-            st.rc_retries--;
-            opgp_save_state(&st);
+        st.rc_retries--;
+        if (!opgp_save_state(&st)) return SW_MEMORY_FAILURE();
+        if (mbedtls_ct_memcmp(h_rc, st.rc_hash, 32) != 0) {
             return SW_SECURITY_STATUS_NOT_SATISFIED();
         }
         st.rc_retries = st.rc_max_retries;
         opgp_sha256(apdu.data + st.rc_len, apdu.nc - st.rc_len, st.pw1_hash);
         st.pw1_len = (uint8_t)(apdu.nc - st.rc_len);
         st.pw1_retries = st.pw1_max_retries;
-        opgp_save_state(&st);
+        if (!opgp_save_state(&st)) return SW_MEMORY_FAILURE();
         return SW_OK();
     }
 }
@@ -1252,7 +1272,7 @@ static int cmd_opgp_set_pin_retries(void) {
     st.rc_retries = (st.rc_len > 0) ? apdu.data[1] : 0;
     st.pw3_max_retries = apdu.data[2];
     st.pw3_retries = apdu.data[2];
-    opgp_save_state(&st);
+    if (!opgp_save_state(&st)) return SW_MEMORY_FAILURE();
     return SW_OK();
 }
 
@@ -1363,7 +1383,8 @@ static int opgp_generate_slot_key(opgp_state_t *st, uint8_t slot, opgp_key_hdr_t
         if (ret != 0) return -1;
     }
 
-    if (opgp_store_key_record(slot, alg_id, grp_id, bits, pub_buf, pub_len, priv_buf, priv_len) != 0) {
+    if ((!opgp_txn.active && !applet_txn_begin(&opgp_txn)) ||
+        opgp_store_key_record(slot, alg_id, grp_id, bits, pub_buf, pub_len, priv_buf, priv_len) != 0) {
         mbedtls_platform_zeroize(priv_buf, sizeof(priv_buf));
         return -1;
     }
@@ -1373,7 +1394,7 @@ static int opgp_generate_slot_key(opgp_state_t *st, uint8_t slot, opgp_key_hdr_t
     if (slot == OPGP_SLOT_SIG) {
         st->sig_counter = 0;
     }
-    opgp_save_state(st);
+    if (!opgp_save_state(st)) return -1;
 
     if (hdr_out) {
         hdr_out->alg_id = alg_id;
@@ -1421,14 +1442,14 @@ static int cmd_opgp_generate_asym(void) {
         opgp_key_hdr_t hdr;
         static uint8_t pub[600];
         if (opgp_generate_slot_key(&st, (uint8_t)slot, &hdr, pub) != 0) {
-            return SW_EXEC_ERROR();
+            return opgp_txn.faulted ? SW_MEMORY_FAILURE() : SW_EXEC_ERROR();
         }
         res_APDU_size = (uint16_t)opgp_encode_pubkey_7f49(&hdr, pub, res_APDU);
         return SW_OK();
     }
     else {
         if (slot == OPGP_SLOT_ATT) {
-            if (!opgp_ensure_att_key(&st)) return SW_EXEC_ERROR();
+            if (!opgp_ensure_att_key(&st)) return opgp_txn.faulted ? SW_MEMORY_FAILURE() : SW_EXEC_ERROR();
         }
         opgp_key_hdr_t hdr;
         static uint8_t pub[600];
@@ -1586,7 +1607,8 @@ static int cmd_opgp_put_data_odd(void) {
         }
     }
 
-    if (opgp_store_key_record((uint8_t)slot, alg_id, grp_id, bits, pub_buf, pub_len, priv_buf, priv_len) != 0) {
+    if ((!opgp_txn.active && !applet_txn_begin(&opgp_txn)) ||
+        opgp_store_key_record((uint8_t)slot, alg_id, grp_id, bits, pub_buf, pub_len, priv_buf, priv_len) != 0) {
         mbedtls_platform_zeroize(priv_buf, sizeof(priv_buf));
         return SW_MEMORY_FAILURE();
     }
@@ -1595,7 +1617,7 @@ static int cmd_opgp_put_data_odd(void) {
     if (slot == OPGP_SLOT_SIG) {
         st.sig_counter = 0;
     }
-    opgp_save_state(&st);
+    if (!opgp_save_state(&st)) return SW_MEMORY_FAILURE();
     return SW_OK();
 }
 
@@ -1689,8 +1711,16 @@ static int opgp_sign_with_slot(opgp_state_t *st, uint8_t slot) {
 
     mbedtls_platform_zeroize(priv, sizeof(priv));
     if (rc == SW_OK() && slot == OPGP_SLOT_SIG) {
+        if (st->sig_counter == UINT32_MAX) {
+            mbedtls_platform_zeroize(res_APDU, res_APDU_size);
+            return SW_CONDITIONS_NOT_SATISFIED();
+        }
         st->sig_counter++;
-        opgp_save_state(st);
+        if (!opgp_save_state(st)) {
+            mbedtls_platform_zeroize(res_APDU, res_APDU_size);
+            pw1_81_verified = false;
+            return SW_MEMORY_FAILURE();
+        }
         if (st->pw1_policy == 0) {
             pw1_81_verified = false;
         }
@@ -1862,7 +1892,7 @@ static int cmd_opgp_terminate(void) {
         return SW_SECURITY_STATUS_NOT_SATISFIED();
     }
     st.terminated = 1;
-    opgp_save_state(&st);
+    if (!opgp_save_state(&st)) return SW_MEMORY_FAILURE();
     return SW_OK();
 }
 
@@ -1873,7 +1903,7 @@ static int cmd_opgp_activate(void) {
     static opgp_state_t st;
     if (!opgp_load_state(&st)) return SW_EXEC_ERROR();
     if (st.terminated) {
-        if (!opgp_factory_reset()) return SW_MEMORY_FAILURE();
+        if ((!opgp_txn.active && !applet_txn_begin(&opgp_txn)) || !opgp_factory_reset()) return SW_MEMORY_FAILURE();
     }
     return SW_OK();
 }
@@ -1897,7 +1927,7 @@ static int cmd_opgp_get_attestation(void) {
     if (!opgp_check_touch(st.uif[OPGP_SLOT_ATT][0])) {
         return SW_SECURITY_STATUS_NOT_SATISFIED();
     }
-    if (!opgp_ensure_att_key(&st)) return SW_EXEC_ERROR();
+    if (!opgp_ensure_att_key(&st)) return opgp_txn.faulted ? SW_MEMORY_FAILURE() : SW_EXEC_ERROR();
 
     opgp_key_hdr_t subj_hdr, att_hdr;
     static uint8_t subj_pub[600], att_pub[600], att_priv[1400];
@@ -2015,7 +2045,10 @@ static int cmd_opgp_get_attestation(void) {
 
     /* Store into certificate slot for key_ref */
     uint16_t fid = (uint16_t)(EF_OPENPGP_CERT_BASE + slot);
-    if (!applet_storage_save(fid, res_APDU, cert_len)) return SW_MEMORY_FAILURE();
+    if ((!opgp_txn.active && !applet_txn_begin(&opgp_txn)) || !opgp_record_save(fid, res_APDU, cert_len)) {
+        mbedtls_platform_zeroize(res_APDU, cert_len);
+        return SW_MEMORY_FAILURE();
+    }
     res_APDU_size = (uint16_t)cert_len;
     return SW_OK();
 }
@@ -2029,26 +2062,7 @@ static int openpgp_unload(void) {
     return PICOKEYS_OK;
 }
 
-static int openpgp_process_apdu(void) {
-    if (!cap_supported(CAP_OPENPGP)) {
-        return SW_INS_NOT_SUPPORTED();
-    }
-    uint8_t ins = INS(apdu);
-    static opgp_state_t st;
-    if (!opgp_load_state(&st)) {
-        openpgp_unload();
-        /* Explicit recovery destroys all applet material. Unauthenticated
-         * legacy policies cannot safely be inferred or migrated in place. */
-        if (ins == OPGP_INS_ACTIVATE && P1(apdu) == 0xDE && P2(apdu) == 0xAD && apdu.nc == 0) {
-            if (!opgp_check_touch(OPGP_UIF_ON)) return SW_SECURITY_STATUS_NOT_SATISFIED();
-            if (!opgp_factory_reset()) return SW_MEMORY_FAILURE();
-            return opgp_load_state(&st) ? SW_OK() : SW_EXEC_ERROR();
-        }
-        return SW_EXEC_ERROR();
-    }
-    if (st.terminated && ins != OPGP_INS_ACTIVATE && ins != OPGP_INS_GET_DATA && ins != OPGP_INS_GET_VERSION) {
-        return SW_CONDITIONS_NOT_SATISFIED();
-    }
+static int openpgp_dispatch(uint8_t ins) {
     switch (ins) {
         case OPGP_INS_VERIFY:
             return cmd_opgp_verify();
@@ -2085,6 +2099,31 @@ static int openpgp_process_apdu(void) {
         default:
             return SW_INS_NOT_SUPPORTED();
     }
+}
+
+static int openpgp_process_apdu(void) {
+    if (!cap_supported(CAP_OPENPGP)) return SW_INS_NOT_SUPPORTED();
+    uint8_t ins = INS(apdu);
+    static opgp_state_t st;
+    if (!opgp_load_state(&st)) {
+        openpgp_unload();
+        if (ins == OPGP_INS_ACTIVATE && P1(apdu) == 0xDE && P2(apdu) == 0xAD && apdu.nc == 0) {
+            if (!opgp_check_touch(OPGP_UIF_ON)) return SW_SECURITY_STATUS_NOT_SATISFIED();
+            if (!applet_txn_recover_begin(&opgp_txn) || !opgp_factory_reset() ||
+                !applet_txn_commit(&opgp_txn)) return SW_MEMORY_FAILURE();
+            return SW_OK();
+        }
+        return SW_EXEC_ERROR();
+    }
+    if (st.terminated && ins != OPGP_INS_ACTIVATE && ins != OPGP_INS_GET_DATA && ins != OPGP_INS_GET_VERSION)
+        return SW_CONDITIONS_NOT_SATISFIED();
+    int ret = openpgp_dispatch(ins);
+    if ((opgp_txn.active && !applet_txn_commit(&opgp_txn)) || opgp_txn.faulted) {
+        mbedtls_platform_zeroize(res_APDU, res_APDU_size);
+        openpgp_unload();
+        return SW_MEMORY_FAILURE();
+    }
+    return ret;
 }
 
 static const uint8_t openpgp_aid[] = {

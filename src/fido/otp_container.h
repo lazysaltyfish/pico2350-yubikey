@@ -28,6 +28,8 @@ int otp_container_has_slot_status(uint8_t slot, bool *present);
 int otp_container_read_slot(uint8_t slot, byte_buffer_t *data);
 int otp_container_write_slot(uint8_t slot, const uint8_t *data, size_t data_size, const uint8_t *metadata, size_t metadata_size);
 int otp_container_delete_slot(uint8_t slot);
+/* Destructive maintenance only: erase both banks without authenticating them. */
+int otp_container_purge(void);
 int otp_container_swap_slots(uint8_t slot1, bool present1, const uint8_t *data1, size_t data1_size, const uint8_t *metadata1, size_t metadata1_size, uint8_t slot2, bool present2, const uint8_t *data2, size_t data2_size, const uint8_t *metadata2, size_t metadata2_size);
 
 #endif // _OTP_CONTAINER_H_

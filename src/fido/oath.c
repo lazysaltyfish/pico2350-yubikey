@@ -29,6 +29,7 @@
 #include "management.h"
 #include "oath_container.h"
 #include "oath_put.h"
+#include "applet_txn.h"
 #include "mbedtls/constant_time.h"
 #include "mbedtls/gcm.h"
 #include "mbedtls/hkdf.h"
@@ -84,6 +85,21 @@
 static int oath_process_apdu(void);
 static int oath_unload(void);
 static int oath_migrate_secrets(void);
+
+static applet_txn_t oath_txn = APPLET_TXN_INITIALIZER(EF_OATH_TXN);
+
+static bool oath_storage_ready(void) {
+    if (applet_txn_ready(&oath_txn)) return true;
+    return false;
+}
+
+static int oath_storage_finish(int ret, bool own_transaction) {
+    if (ret != PICOKEYS_OK) {
+        applet_txn_fail(&oath_txn);
+        return ret;
+    }
+    return !own_transaction || applet_txn_commit(&oath_txn) ? PICOKEYS_OK : PICOKEYS_ERR_MEMORY_FATAL;
+}
 
 static bool validated = true;
 static bool otp_pin_verified = false;
@@ -153,16 +169,21 @@ static bool oath_code_present(void) {
 static int oath_select(app_t *a, uint8_t force) {
     (void) force;
     if (cap_supported(CAP_OATH)) {
-        oath_chain_state.type = OATH_CHAIN_NONE;
-        bool code_present = oath_code_present();
-        validated = !code_present && !file_has_data(file_search_by_fid(EF_OTP_PIN, NULL, SPECIFY_EF));
-        otp_pin_verified = false;
-        int migration_ret = oath_migrate_secrets();
-        if (migration_ret != PICOKEYS_OK) {
-            return migration_ret;
-        }
         a->process_apdu = oath_process_apdu;
         a->unload = oath_unload;
+        oath_chain_state.type = OATH_CHAIN_NONE;
+        otp_pin_verified = false;
+        if (!oath_storage_ready()) {
+            validated = false;
+            return PICOKEYS_ERR_MEMORY_FATAL;
+        }
+        bool code_present = oath_code_present();
+        validated = !code_present && !file_has_data(file_search_by_fid(EF_OTP_PIN, NULL, SPECIFY_EF));
+        int migration_ret = oath_migrate_secrets();
+        if (migration_ret != PICOKEYS_OK) {
+            validated = false;
+            return migration_ret;
+        }
         res_APDU_size = 0;
         res_APDU[res_APDU_size++] = TAG_T_VERSION;
         res_APDU[res_APDU_size++] = 3;
@@ -425,25 +446,17 @@ static int oath_migrate_secrets(void) {
         return PICOKEYS_OK;
     }
 
+    if (!applet_txn_begin(&oath_txn)) return PICOKEYS_ERR_MEMORY_FATAL;
     oath_migration_ctx_t migration = { .ret = PICOKEYS_OK, .changed = false };
     file_for_each_dynamic(oath_migrate_cred_cb, &migration);
-    bool changed = migration.changed;
-    if (migration.ret != PICOKEYS_OK) {
-        return migration.ret;
-    }
+    if (migration.ret != PICOKEYS_OK) return oath_storage_finish(migration.ret, true);
 
     file_t *ef_code = file_search(EF_OATH_CODE);
     if (file_has_data(ef_code) && !oath_key_is_secure(file_get_data(ef_code), file_get_size(ef_code))) {
         int ret = oath_put_code_key(ef_code, file_get_data(ef_code), file_get_size(ef_code));
-        if (ret != PICOKEYS_OK) {
-            return ret;
-        }
-        changed = true;
+        if (ret != PICOKEYS_OK) return oath_storage_finish(ret, true);
     }
-
-    if (changed) {
-        flash_commit();
-    }
+    if (oath_storage_finish(PICOKEYS_OK, true) != PICOKEYS_OK) return PICOKEYS_ERR_MEMORY_FATAL;
     oath_migration_done = true;
     return PICOKEYS_OK;
 }
@@ -580,16 +593,13 @@ static int oath_credential_metadata(const uint8_t *data, uint16_t data_size, uin
     return PICOKEYS_OK;
 }
 
-static int oath_credential_write(uint16_t fid, const uint8_t *data, uint16_t data_size) {
+static int oath_credential_write_uncommitted(uint16_t fid, const uint8_t *data, uint16_t data_size) {
     if (!data || fid < EF_OATH_CRED || fid >= EF_OATH_CRED + MAX_OATH_CRED) {
         return PICOKEYS_ERR_NULL_PARAM;
     }
     file_t *file = file_search(fid);
     if (file_has_data(file) && !oath_container_is_marker(file)) {
         int ret = oath_put_credential_data(file, data, data_size);
-        if (ret == PICOKEYS_OK) {
-            flash_commit();
-        }
         return ret;
     }
 
@@ -613,15 +623,23 @@ static int oath_credential_write(uint16_t fid, const uint8_t *data, uint16_t dat
     return ret;
 }
 
+static int oath_credential_write(uint16_t fid, const uint8_t *data, uint16_t size) {
+    if (!oath_storage_ready()) return PICOKEYS_ERR_MEMORY_FATAL;
+    bool own = !oath_txn.active;
+    if (own && !applet_txn_begin(&oath_txn)) return PICOKEYS_ERR_MEMORY_FATAL;
+    return oath_storage_finish(oath_credential_write_uncommitted(fid, data, size), own);
+}
+
 static int oath_credential_delete(uint16_t fid) {
     file_t *file = file_search(fid);
     if (!file_has_data(file)) {
         return PICOKEYS_ERR_FILE_NOT_FOUND;
     }
-    if (oath_container_is_marker(file)) {
-        return oath_container_delete(oath_credential_slot(fid));
-    }
-    return file_delete(file);
+    if (!oath_storage_ready()) return PICOKEYS_ERR_MEMORY_FATAL;
+    bool own = !oath_txn.active;
+    if (own && !applet_txn_begin(&oath_txn)) return PICOKEYS_ERR_MEMORY_FATAL;
+    int ret = oath_container_is_marker(file) ? oath_container_delete(oath_credential_slot(fid)) : file_delete(file);
+    return oath_storage_finish(ret, own);
 }
 
 static bool find_oath_cred(const uint8_t *name, size_t name_len, uint16_t *fid) {
@@ -678,7 +696,7 @@ static int cmd_put(void) {
         mbedtls_platform_zeroize(put_copy, put_len);
         free(put_copy);
         if (ret != PICOKEYS_OK) {
-            return SW_EXEC_ERROR();
+            return ret == PICOKEYS_ERR_MEMORY_FATAL || oath_txn.faulted ? SW_MEMORY_FAILURE() : SW_EXEC_ERROR();
         }
     }
     else {
@@ -695,7 +713,7 @@ static int cmd_put(void) {
                 mbedtls_platform_zeroize(put_copy, put_len);
                 free(put_copy);
                 if (ret != PICOKEYS_OK) {
-                    return SW_EXEC_ERROR();
+                    return ret == PICOKEYS_ERR_MEMORY_FATAL || oath_txn.faulted ? SW_MEMORY_FAILURE() : SW_EXEC_ERROR();
                 }
                 return SW_OK();
             }
@@ -742,9 +760,12 @@ static int cmd_set_code(void) {
         return SW_SECURITY_STATUS_NOT_SATISFIED();
     }
     if (apdu.nc == 0) {
-        int ret = file_delete(file_search(EF_OATH_CODE));
+        if (!applet_txn_begin(&oath_txn)) return SW_MEMORY_FAILURE();
+        file_t *code_file = file_search(EF_OATH_CODE);
+        int ret = oath_storage_finish(code_file ? file_delete(code_file) : PICOKEYS_OK, true);
+        if (ret != PICOKEYS_OK) return SW_MEMORY_FAILURE();
         validated = true;
-        return ret == PICOKEYS_OK ? SW_OK() : SW_MEMORY_FAILURE();
+        return SW_OK();
     }
     tlv_ctx_t ctxi, key = { 0 }, chal = { 0 }, resp = { 0 };
     tlv_ctx_init(BYTE_ARRAY(apdu.data, apdu.nc), &ctxi);
@@ -755,9 +776,12 @@ static int cmd_set_code(void) {
         return SW_WRONG_DATA();
     }
     if (key.len == 0) {
-        int ret = file_delete(file_search(EF_OATH_CODE));
+        if (!applet_txn_begin(&oath_txn)) return SW_MEMORY_FAILURE();
+        file_t *code_file = file_search(EF_OATH_CODE);
+        int ret = oath_storage_finish(code_file ? file_delete(code_file) : PICOKEYS_OK, true);
+        if (ret != PICOKEYS_OK) return SW_MEMORY_FAILURE();
         validated = true;
-        return ret == PICOKEYS_OK ? SW_OK() : SW_MEMORY_FAILURE();
+        return SW_OK();
     }
     if (tlv_find_tag(&ctxi, TAG_CHALLENGE, &chal) == false) {
         return SW_INCORRECT_PARAMS();
@@ -782,21 +806,28 @@ static int cmd_set_code(void) {
         return SW_DATA_INVALID();
     }
 
+    if (!applet_txn_begin(&oath_txn)) return SW_MEMORY_FAILURE();
+    file_t *ef_otp_pin = file_search_by_fid(EF_OTP_PIN, NULL, SPECIFY_EF);
+    if (file_has_data(ef_otp_pin) && flash_clear_file(ef_otp_pin) != PICOKEYS_OK) {
+        applet_txn_fail(&oath_txn);
+        return SW_MEMORY_FAILURE();
+    }
+    if (random_fill_buffer(BYTE_ARRAY(challenge, sizeof(challenge))) != PICOKEYS_OK) {
+        applet_txn_fail(&oath_txn);
+        return SW_EXEC_ERROR();
+    }
+    file_t *ef = file_new(EF_OATH_CODE);
+    if (ef == NULL || oath_put_code_key(ef, key.data, key.len) != PICOKEYS_OK) {
+        applet_txn_fail(&oath_txn);
+        return SW_MEMORY_FAILURE();
+    }
+    if (oath_storage_finish(PICOKEYS_OK, true) != PICOKEYS_OK) return SW_MEMORY_FAILURE();
 #ifdef ENABLE_EMULATION
     validated = false;
 #else
     validated = true;
 #endif
-    file_t *ef_otp_pin = file_search_by_fid(EF_OTP_PIN, NULL, SPECIFY_EF);
-    if (file_has_data(ef_otp_pin) && flash_clear_file(ef_otp_pin) != PICOKEYS_OK) {
-        return SW_MEMORY_FAILURE();
-    }
-    random_fill_buffer(BYTE_ARRAY(challenge, sizeof(challenge)));
-    file_t *ef = file_new(EF_OATH_CODE);
-    if (ef == NULL || oath_put_code_key(ef, key.data, key.len) != PICOKEYS_OK) {
-        return SW_EXEC_ERROR();
-    }
-    flash_commit();
+    otp_pin_verified = false;
     return SW_OK();
 }
 
@@ -804,22 +835,20 @@ static int cmd_reset(void) {
     if (P1(apdu) != 0xde || P2(apdu) != 0xad) {
         return SW_INCORRECT_P1P2();
     }
-    uint16_t fids[MAX_OATH_CRED];
-    size_t num_creds = present_oath_cred_fids(fids, MAX_OATH_CRED);
-    for (size_t i = 0; i < num_creds; i++) {
-        file_t *ef = file_search(fids[i]);
-        if (oath_container_is_marker(ef)) {
-            if (oath_container_purge(oath_credential_slot(fids[i])) != PICOKEYS_OK) {
-                return SW_EXEC_ERROR();
-            }
-        }
-        else if (file_has_data(ef)) {
-            file_delete_no_commit(ef);
+    if (!oath_txn.active && !applet_txn_begin(&oath_txn)) return SW_MEMORY_FAILURE();
+    for (uint16_t slot = 0; slot < MAX_OATH_CRED; slot++) {
+        if (oath_container_purge((uint8_t)slot) != PICOKEYS_OK) {
+            applet_txn_fail(&oath_txn);
+            return SW_MEMORY_FAILURE();
         }
     }
-    file_delete_no_commit(file_search(EF_OATH_CODE));
-    flash_clear_file(file_search_by_fid(EF_OTP_PIN, NULL, SPECIFY_EF));
-    flash_commit();
+    file_t *code = file_search(EF_OATH_CODE);
+    if ((code && file_delete_no_commit(code) != PICOKEYS_OK) ||
+        flash_clear_file(file_search_by_fid(EF_OTP_PIN, NULL, SPECIFY_EF)) != PICOKEYS_OK) {
+        applet_txn_fail(&oath_txn);
+        return SW_MEMORY_FAILURE();
+    }
+    if (oath_storage_finish(PICOKEYS_OK, true) != PICOKEYS_OK) return SW_MEMORY_FAILURE();
     validated = true;
     otp_pin_verified = false;
     return SW_OK();
@@ -1077,6 +1106,12 @@ static int cmd_calculate(void) {
     const uint8_t *effective_chal = chal.data;
     size_t effective_chal_len = chal.len;
     if (is_hotp) {
+        if (chal.len != sizeof(hotp_chal) || get_uint64_be(chal.data) == UINT64_MAX) {
+            mbedtls_platform_zeroize(plain_key, plain_key_len);
+            free(plain_key);
+            oath_credential_close(&credential);
+            return SW_CONDITIONS_NOT_SATISFIED();
+        }
         memcpy(hotp_chal, chal.data, sizeof(hotp_chal));
         uint64_t v = get_uint64_be(chal.data) + 1;
 
@@ -1293,11 +1328,17 @@ static otp_pin_match_result_t oath_check_pin(file_t *ef_otp_pin, size_t record_l
         return OTP_PIN_BLOCKED;
     }
 
+    if (!applet_txn_begin(&oath_txn)) return OTP_PIN_STORAGE_ERROR;
     record[0] -= 1;
     if (file_put_data(ef_otp_pin, CONST_BYTE_ARRAY(record, record_len)) != PICOKEYS_OK ||
         !flash_commit_sync(OTP_PIN_RETRY_COMMIT_TIMEOUT_MS) ||
         file_get_size(ef_otp_pin) != record_len || file_get_data(ef_otp_pin) == NULL ||
         file_get_data(ef_otp_pin)[0] != record[0]) {
+        mbedtls_platform_zeroize(record, sizeof(record));
+        applet_txn_fail(&oath_txn);
+        return OTP_PIN_STORAGE_ERROR;
+    }
+    if (oath_storage_finish(PICOKEYS_OK, true) != PICOKEYS_OK) {
         mbedtls_platform_zeroize(record, sizeof(record));
         return OTP_PIN_STORAGE_ERROR;
     }
@@ -1320,12 +1361,13 @@ static int cmd_set_otp_pin(void) {
         return SW_INCORRECT_PARAMS();
     }
     otp_pin_record_v1(pw.data, pw.len, record);
-    int ret = file_put_data(ef_otp_pin, CONST_BYTE_ARRAY(record, sizeof(record)));
-    mbedtls_platform_zeroize(record, sizeof(record));
-    if (ret != PICOKEYS_OK) {
+    if (!applet_txn_begin(&oath_txn)) {
+        mbedtls_platform_zeroize(record, sizeof(record));
         return SW_MEMORY_FAILURE();
     }
-    flash_commit();
+    int ret = oath_storage_finish(file_put_data(ef_otp_pin, CONST_BYTE_ARRAY(record, sizeof(record))), true);
+    mbedtls_platform_zeroize(record, sizeof(record));
+    if (ret != PICOKEYS_OK) return SW_MEMORY_FAILURE();
     otp_pin_verified = false;
     return SW_OK();
 }
@@ -1347,20 +1389,29 @@ static int cmd_change_otp_pin(void) {
     }
     otp_pin_match_result_t match = oath_check_pin(ef_otp_pin, record_len, pw.data, pw.len);
     if (match == OTP_PIN_STORAGE_ERROR) {
+        validated = false;
         otp_pin_verified = false;
         return SW_MEMORY_FAILURE();
     }
     if (match != OTP_PIN_MATCH) {
+        validated = false;
         otp_pin_verified = false;
         return SW_SECURITY_STATUS_NOT_SATISFIED();
     }
     otp_pin_record_v1(new_pw.data, new_pw.len, record);
-    int ret = file_put_data(ef_otp_pin, CONST_BYTE_ARRAY(record, sizeof(record)));
-    mbedtls_platform_zeroize(record, sizeof(record));
-    if (ret != PICOKEYS_OK) {
+    if (!applet_txn_begin(&oath_txn)) {
+        mbedtls_platform_zeroize(record, sizeof(record));
+        validated = false;
+        otp_pin_verified = false;
         return SW_MEMORY_FAILURE();
     }
-    flash_commit();
+    int ret = oath_storage_finish(file_put_data(ef_otp_pin, CONST_BYTE_ARRAY(record, sizeof(record))), true);
+    mbedtls_platform_zeroize(record, sizeof(record));
+    if (ret != PICOKEYS_OK) {
+        validated = false;
+        otp_pin_verified = false;
+        return SW_MEMORY_FAILURE();
+    }
     otp_pin_verified = false;
     return SW_OK();
 }
@@ -1372,6 +1423,7 @@ static int cmd_verify_otp_pin(void) {
     if (!file_has_data(ef_otp_pin) || (record_len != OTP_PIN_LEGACY_SIZE && record_len != OTP_PIN_V1_SIZE)) {
         return SW_CONDITIONS_NOT_SATISFIED();
     }
+    validated = false;
     otp_pin_verified = false;
     tlv_ctx_t ctxi, pw = { 0 };
     tlv_ctx_init(BYTE_ARRAY(apdu.data, apdu.nc), &ctxi);
@@ -1387,12 +1439,13 @@ static int cmd_verify_otp_pin(void) {
         return SW_SECURITY_STATUS_NOT_SATISFIED();
     }
     otp_pin_record_v1(pw.data, pw.len, record);
-    int ret = file_put_data(ef_otp_pin, CONST_BYTE_ARRAY(record, sizeof(record)));
-    mbedtls_platform_zeroize(record, sizeof(record));
-    if (ret != PICOKEYS_OK) {
+    if (!applet_txn_begin(&oath_txn)) {
+        mbedtls_platform_zeroize(record, sizeof(record));
         return SW_MEMORY_FAILURE();
     }
-    flash_commit();
+    int ret = oath_storage_finish(file_put_data(ef_otp_pin, CONST_BYTE_ARRAY(record, sizeof(record))), true);
+    mbedtls_platform_zeroize(record, sizeof(record));
+    if (ret != PICOKEYS_OK) return SW_MEMORY_FAILURE();
     validated = true;
     otp_pin_verified = true;
     return SW_OK();
@@ -1542,7 +1595,7 @@ static int cmd_rename(void) {
     mbedtls_platform_zeroize(new_data, fsize + new_name.len - name.len);
     free(new_data);
     oath_credential_close(&credential);
-    return ret == PICOKEYS_OK ? SW_OK() : SW_EXEC_ERROR();
+    return ret == PICOKEYS_OK ? SW_OK() : (ret == PICOKEYS_ERR_MEMORY_FATAL || oath_txn.faulted ? SW_MEMORY_FAILURE() : SW_EXEC_ERROR());
 }
 
 static int cmd_get_credential(void) {
@@ -1623,6 +1676,18 @@ static const cmd_t cmds[] = {
 };
 
 static int oath_process_apdu(void) {
+    if (!oath_storage_ready()) {
+        validated = otp_pin_verified = false;
+        oath_chain_state.type = OATH_CHAIN_NONE;
+        bool reset = CLA(apdu) == 0 && INS(apdu) == INS_RESET && P1(apdu) == 0xde && P2(apdu) == 0xad && apdu.nc == 0;
+        if (!reset) return SW_MEMORY_FAILURE();
+        bool prior_force = force_button_wait;
+        force_button_wait = true;
+        bool touched = wait_button_pressed_timeout(15) == 0;
+        force_button_wait = prior_force;
+        if (!touched) return SW_SECURITY_STATUS_NOT_SATISFIED();
+        if (!applet_txn_recover_begin(&oath_txn)) return SW_MEMORY_FAILURE();
+    }
     if (CLA(apdu) != 0x00) {
         oath_chain_state.type = OATH_CHAIN_NONE;
         return SW_CLA_NOT_SUPPORTED();

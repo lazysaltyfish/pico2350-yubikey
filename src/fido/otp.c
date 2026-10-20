@@ -30,17 +30,7 @@
 #if defined(PICO_PLATFORM)
 #include "bsp/board.h"
 #endif
-#ifdef ENABLE_EMULATION
-void add_keyboard_buffer(const_byte_array_t data, bool press_enter) {
-    (void)data;
-    (void)press_enter;
-}
-void append_keyboard_buffer(const_byte_array_t data) {
-    (void)data;
-}
-#else
 #include "tusb.h"
-#endif
 #include "mbedtls/aes.h"
 #include "mbedtls/constant_time.h"
 #include "mbedtls/hkdf.h"
@@ -49,6 +39,7 @@ void append_keyboard_buffer(const_byte_array_t data) {
 #include "management.h"
 #include "otp_container.h"
 #include "otp_transport.h"
+#include "applet_txn.h"
 
 #define FIXED_SIZE          16
 #define KEY_SIZE            16
@@ -117,6 +108,15 @@ void append_keyboard_buffer(const_byte_array_t data) {
 #define CFGFLAG_UPDATE_MASK (PACING_10MS | PACING_20MS)
 
 static uint8_t config_seq = { 1 };
+static applet_txn_t otp_txn = APPLET_TXN_INITIALIZER(EF_OTP_TXN);
+
+static int otp_storage_finish(int ret, bool own_transaction) {
+    if (ret != PICOKEYS_OK) {
+        applet_txn_fail(&otp_txn);
+        return ret;
+    }
+    return !own_transaction || applet_txn_commit(&otp_txn) ? PICOKEYS_OK : PICOKEYS_ERR_MEMORY_FATAL;
+}
 
 PACK(
 typedef struct otp_config {
@@ -285,7 +285,7 @@ static void otp_slot_metadata_build(const uint8_t *plain, otp_slot_metadata_t *m
     metadata->cfg_flags = config->cfg_flags;
 }
 
-static int otp_slot_store(uint16_t fid, const uint8_t *plain, uint16_t plain_len) {
+static int otp_slot_store_uncommitted(uint16_t fid, const uint8_t *plain, uint16_t plain_len) {
     if (plain == NULL || (plain_len != otp_config_size && plain_len != OTP_SLOT_PLAIN_MAX)) {
         return PICOKEYS_WRONG_DATA;
     }
@@ -300,17 +300,26 @@ static int otp_slot_store(uint16_t fid, const uint8_t *plain, uint16_t plain_len
     return ret;
 }
 
+static int otp_slot_store(uint16_t fid, const uint8_t *plain, uint16_t size) {
+    if (!applet_txn_ready(&otp_txn)) return PICOKEYS_ERR_MEMORY_FATAL;
+    bool own = !otp_txn.active;
+    if (own && !applet_txn_begin(&otp_txn)) return PICOKEYS_ERR_MEMORY_FATAL;
+    return otp_storage_finish(otp_slot_store_uncommitted(fid, plain, size), own);
+}
+
 static int otp_slot_delete(uint16_t fid) {
     bool present = false;
     int ret = otp_slot_has_data_status(fid, &present);
     if (ret != PICOKEYS_OK) {
         return ret;
     }
-    if (present && otp_container_is_marker(file_search(fid))) {
-        return otp_container_delete_slot((uint8_t)(fid - EF_OTP_SLOT1));
-    }
+    if (!applet_txn_ready(&otp_txn)) return PICOKEYS_ERR_MEMORY_FATAL;
+    bool own = !otp_txn.active;
+    if (own && !applet_txn_begin(&otp_txn)) return PICOKEYS_ERR_MEMORY_FATAL;
     file_t *ef = file_search(fid);
-    return ef ? file_delete(ef) : PICOKEYS_OK;
+    ret = present && otp_container_is_marker(ef) ? otp_container_delete_slot((uint8_t)(fid - EF_OTP_SLOT1)) :
+          (ef ? file_delete(ef) : PICOKEYS_OK);
+    return otp_storage_finish(ret, own);
 }
 
 static int otp_migrate_slots(void) {
@@ -350,13 +359,23 @@ const uint8_t otp_aid[] = {
 static int otp_select(app_t *a, uint8_t force) {
     (void) force;
     if (cap_supported(CAP_OTP)) {
-        init_otp();
-        int ret = otp_migrate_slots();
-        if (ret != PICOKEYS_OK) {
-            return ret;
+#if defined(PICO_PLATFORM)
+        if (get_core_num() != 1) {
+            /* A USB-side SELECT must not scan, migrate or commit Flash. */
+            const uint8_t status[7] = { PICO_FIDO_VERSION_MAJOR, PICO_FIDO_VERSION_MINOR,
+                                       PICO_FIDO_VERSION_PATCH, 0, 0, 0, 0x20 };
+            a->process_apdu = otp_process_apdu;
+            a->unload = otp_unload;
+            memcpy(res_APDU, status, sizeof(status));
+            res_APDU_size = sizeof(status);
+            apdu.ne = res_APDU_size;
+            return PICOKEYS_OK;
         }
+#endif
         a->process_apdu = otp_process_apdu;
         a->unload = otp_unload;
+        init_otp();
+        if (!applet_txn_ready(&otp_txn)) return PICOKEYS_ERR_MEMORY_FATAL;
         if (otp_slot_has_data(EF_OTP_SLOT1) || otp_slot_has_data(EF_OTP_SLOT2)) {
             if (config_seq == 0) {
                 config_seq = 1;
@@ -365,8 +384,7 @@ static int otp_select(app_t *a, uint8_t force) {
         else {
             config_seq = 0;
         }
-        otp_status(false);
-        return PICOKEYS_OK;
+        return otp_status(false) == SW_OK() ? PICOKEYS_OK : PICOKEYS_ERR_MEMORY_FATAL;
     }
     return PICOKEYS_ERR_FILE_NOT_FOUND;
 }
@@ -383,48 +401,47 @@ static int encode_modhex(const uint8_t *in, size_t len, uint8_t *out) {
 static bool scanned = false;
 
 void init_otp(void) {
-    if (scanned == false) {
-        scan_all();
-        if (otp_migrate_slots() != PICOKEYS_OK) {
+#if defined(PICO_PLATFORM)
+    /* HID INIT/USB callbacks run on core 0. Only the card worker can wait for
+     * Flash persistence without deadlocking the USB/Flash service loop. */
+    if (get_core_num() != 1) return;
+#endif
+    if (scanned || !applet_txn_ready(&otp_txn)) return;
+    scan_all();
+    if (!applet_txn_begin(&otp_txn)) return;
+    if (otp_migrate_slots() != PICOKEYS_OK) {
+        applet_txn_fail(&otp_txn);
+        return;
+    }
+    for (uint8_t i = 0; i < FIDO_OTP_SLOT_COUNT; i++) {
+        uint8_t data[OTP_SLOT_PLAIN_MAX] = { 0 };
+        uint16_t size = 0;
+        int ret = otp_slot_load((uint16_t)(EF_OTP_SLOT1 + i), data, &size);
+        if (ret == PICOKEYS_ERR_FILE_NOT_FOUND) continue;
+        if (ret != PICOKEYS_OK) {
+            mbedtls_platform_zeroize(data, sizeof(data));
+            applet_txn_fail(&otp_txn);
             return;
         }
-        for (uint8_t i = 0; i < 4; i++) {
-            uint8_t data[OTP_SLOT_PLAIN_MAX] = { 0 };
-            uint16_t data_len = 0;
-            int ret = otp_slot_load((uint16_t)(EF_OTP_SLOT1 + i), data, &data_len);
-            for (uint8_t tries = 1; ret != PICOKEYS_OK && tries < OTP_BUMP_TRIES; tries++) {
-                ret = otp_slot_load((uint16_t)(EF_OTP_SLOT1 + i), data, &data_len);
+        otp_config_t *config = (otp_config_t *)data;
+        if (size == OTP_SLOT_PLAIN_MAX && !(config->tkt_flags & OATH_HOTP) &&
+            !(config->cfg_flags & (SHORT_TICKET | STATIC_TICKET))) {
+            uint16_t counter = get_uint16_be(data + otp_config_size);
+            if (counter >= 0x7fff) ret = PICOKEYS_WRONG_DATA;
+            else {
+                put_uint16_be(counter + 1u, data + otp_config_size);
+                ret = otp_slot_store((uint16_t)(EF_OTP_SLOT1 + i), data, size);
             }
-            if (ret != PICOKEYS_OK) {
-                continue;
-            }
-            otp_config_t *otp_config = (otp_config_t *) data;
-            if (data_len == OTP_SLOT_PLAIN_MAX && !(otp_config->tkt_flags & OATH_HOTP) &&
-                !(otp_config->cfg_flags & SHORT_TICKET || otp_config->cfg_flags & STATIC_TICKET)) {
-                uint16_t counter = get_uint16_be(data + otp_config_size);
-                if (++counter <= 0x7fff) {
-                    put_uint16_be(counter, data + otp_config_size);
-                    ret = otp_slot_store((uint16_t)(EF_OTP_SLOT1 + i), data, data_len);
-                    for (uint8_t tries = 1; ret != PICOKEYS_OK && tries < OTP_BUMP_TRIES; tries++) {
-                        ret = otp_slot_store((uint16_t)(EF_OTP_SLOT1 + i), data, data_len);
-                    }
-                    if (ret != PICOKEYS_OK) {
-                        mbedtls_platform_zeroize(data, sizeof(data));
-                        return;
-                    }
-                }
-            }
-            mbedtls_platform_zeroize(data, sizeof(data));
         }
-        if (otp_slot_has_data(EF_OTP_SLOT1) || otp_slot_has_data(EF_OTP_SLOT2)) {
-            config_seq = 1;
+        mbedtls_platform_zeroize(data, sizeof(data));
+        if (ret != PICOKEYS_OK) {
+            applet_txn_fail(&otp_txn);
+            return;
         }
-        else {
-            config_seq = 0;
-        }
-        scanned = true;
-        flash_commit();
     }
+    if (otp_storage_finish(PICOKEYS_OK, true) != PICOKEYS_OK) return;
+    config_seq = otp_slot_has_data(EF_OTP_SLOT1) || otp_slot_has_data(EF_OTP_SLOT2) ? 1 : 0;
+    scanned = true;
 }
 static uint16_t calculate_crc(const uint8_t *data, size_t data_len) {
     uint16_t crc = 0xFFFF;
@@ -444,6 +461,7 @@ static uint16_t calculate_crc(const uint8_t *data, size_t data_len) {
 static uint8_t session_counter[FIDO_OTP_SLOT_COUNT] = { 0 };
 static int otp_button_pressed_impl(uint8_t slot) {
     init_otp();
+    if (!scanned || !applet_txn_ready(&otp_txn)) return 1;
     if (!cap_supported(CAP_OTP)) {
         return 3;
     }
@@ -479,6 +497,11 @@ static int otp_button_pressed_impl(uint8_t slot) {
         if (imf == 0) {
             imf = (uint64_t)get_uint16_be(otp_config->uid + 4) * 16u;
         }
+        if (imf == UINT64_MAX) {
+            mbedtls_platform_zeroize(tmp_key, sizeof(tmp_key));
+            mbedtls_platform_zeroize(data, sizeof(data));
+            return 1;
+        }
         uint8_t chal[8];
         put_uint64_be(imf, chal);
         res_APDU_size = 0;
@@ -496,23 +519,33 @@ static int otp_button_pressed_impl(uint8_t slot) {
                 out_len = (size_t)fsize * 2u;
             }
             if (otp_config->cfg_flags & OATH_HOTP8) {
-                sprintf(out_str + out_len, "%08lu", (long unsigned int) number);
+                snprintf(out_str + out_len, sizeof(out_str) - out_len, "%08lu", (long unsigned int) number);
                 out_len += 8;
             }
             else {
-                sprintf(out_str + out_len, "%06lu", (long unsigned int) number);
+                snprintf(out_str + out_len, sizeof(out_str) - out_len, "%06lu", (long unsigned int) number);
                 out_len += 6;
             }
-            add_keyboard_buffer(CONST_BYTE_ARRAY((const uint8_t *)out_str, out_len), true);
             imf++;
             uint8_t new_chal[8];
             put_uint64_be(imf, new_chal);
             uint8_t new_otp_config[otp_config_size + sizeof(new_chal)];
             memcpy(new_otp_config, otp_config, otp_config_size);
             memcpy(new_otp_config + otp_config_size, new_chal, sizeof(new_chal));
-            otp_slot_store(slot_ef, new_otp_config, sizeof(new_otp_config));
+            int stored = otp_slot_store(slot_ef, new_otp_config, sizeof(new_otp_config));
             mbedtls_platform_zeroize(new_otp_config, sizeof(new_otp_config));
-            flash_commit();
+            if (stored != PICOKEYS_OK) {
+                mbedtls_platform_zeroize(out_str, sizeof(out_str));
+                mbedtls_platform_zeroize(data, sizeof(data));
+                res_APDU_size = 0;
+                return 1;
+            }
+            add_keyboard_buffer(CONST_BYTE_ARRAY((const uint8_t *)out_str, out_len), true);
+            mbedtls_platform_zeroize(out_str, sizeof(out_str));
+        }
+        else {
+            mbedtls_platform_zeroize(data, sizeof(data));
+            return 1;
         }
         if (otp_config->tkt_flags & APPEND_CR) {
             append_keyboard_buffer(CONST_BYTE_ARRAY((const uint8_t *)"\r", 1));
@@ -541,6 +574,10 @@ static int otp_button_pressed_impl(uint8_t slot) {
         uint16_t counter = data_len == OTP_SLOT_PLAIN_MAX ? get_uint16_be(data + otp_config_size) : 0;
         uint16_t crc = 0;
         uint32_t ts = board_millis() / 1000;
+        if (counter > 0x7fff || (counter == 0x7fff && session_counter[slot - 1] == UINT8_MAX)) {
+            mbedtls_platform_zeroize(data, sizeof(data));
+            return 1;
+        }
         if (counter == 0) {
             update_counter = true;
             counter = 1;
@@ -588,7 +625,6 @@ static int otp_button_pressed_impl(uint8_t slot) {
                 return 1;
             }
             mbedtls_platform_zeroize(new_data, sizeof(new_data));
-            flash_commit();
         }
         session_counter[slot - 1] = next_session_counter;
         add_keyboard_buffer(CONST_BYTE_ARRAY((const uint8_t *)otp_out, total_raw * 2u), true);
@@ -612,7 +648,7 @@ int otp_hid_button(uint8_t slot) {
     uint8_t response[64] = {0};
     apdu = (struct apdu){.rdata=response, .ne=sizeof(response)};
     int result = otp_button_pressed_impl(slot);
-    apdu.rdata = NULL;
+    apdu = (struct apdu){0};
     return result;
 }
 
@@ -671,9 +707,21 @@ static uint16_t otp_status_ext(void) {
 void otp_hid_refresh_status(void) {
     uint8_t snapshot[8] = {0};
     uint16_t used = 1;
-    if (scanned == false) {
-        scan_all();
-        scanned = true;
+    snapshot[1] = PICO_FIDO_VERSION_MAJOR;
+    snapshot[2] = PICO_FIDO_VERSION_MINOR;
+    snapshot[3] = PICO_FIDO_VERSION_PATCH;
+#if defined(PICO_PLATFORM)
+    if (get_core_num() != 1) {
+        snapshot[7] = 0x20;
+        otp_hid_update_status(snapshot);
+        return;
+    }
+#endif
+    init_otp();
+    if (!scanned || !applet_txn_ready(&otp_txn)) {
+        snapshot[7] = 0x10;
+        otp_hid_update_status(snapshot);
+        return;
     }
     snapshot[used++] = PICO_FIDO_VERSION_MAJOR;
     snapshot[used++] = PICO_FIDO_VERSION_MINOR;
@@ -711,6 +759,7 @@ void otp_hid_refresh_status(void) {
 }
 
 static uint16_t otp_status(bool is_otp) {
+    if (!scanned || !applet_txn_ready(&otp_txn)) return SW_MEMORY_FAILURE();
     /* Build the snapshot without borrowing the active request's APDU pointers. */
     otp_hid_refresh_status();
     uint8_t snapshot[8];
@@ -772,11 +821,14 @@ static int cmd_otp(void) {
                 if (odata->rfu[0] != 0 || odata->rfu[1] != 0 || check_crc(odata) == false) {
                     return SW_WRONG_DATA();
                 }
-                memset(apdu.data + otp_config_size, 0, 8); // Add 8 bytes extra
-                if (otp_slot_store(slot, apdu.data, OTP_SLOT_PLAIN_MAX) != PICOKEYS_OK) {
+                uint8_t configured[OTP_SLOT_PLAIN_MAX] = { 0 };
+                memcpy(configured, apdu.data, otp_config_size);
+                int stored = otp_slot_store(slot, configured, sizeof(configured));
+                mbedtls_platform_zeroize(configured, sizeof(configured));
+                if (stored != PICOKEYS_OK) {
                     return SW_MEMORY_FAILURE();
                 }
-                flash_commit();
+                session_counter[slot - EF_OTP_SLOT1] = 0;
                 config_seq++;
                 return otp_status(_is_otp);
             }
@@ -845,7 +897,6 @@ static int cmd_otp(void) {
                 return SW_MEMORY_FAILURE();
             }
             mbedtls_platform_zeroize(current, sizeof(current));
-            flash_commit();
             config_seq++;
         }
         return otp_status(_is_otp);
@@ -933,6 +984,12 @@ static int cmd_otp(void) {
                 return SW_SECURITY_STATUS_NOT_SATISFIED();
             }
         }
+        if (!applet_txn_begin(&otp_txn)) {
+            mbedtls_platform_zeroize(data1, sizeof(data1));
+            mbedtls_platform_zeroize(data2, sizeof(data2));
+            mbedtls_platform_zeroize(access_code, sizeof(access_code));
+            return SW_MEMORY_FAILURE();
+        }
         bool legacy1 = file_has_data(ef1) && !otp_container_is_marker(ef1);
         bool legacy2 = file_has_data(ef2) && !otp_container_is_marker(ef2);
         if (!legacy1 && !legacy2 && (ef1_data || ef2_data)) {
@@ -950,9 +1007,7 @@ static int cmd_otp(void) {
             mbedtls_platform_zeroize(data1, sizeof(data1));
             mbedtls_platform_zeroize(data2, sizeof(data2));
             mbedtls_platform_zeroize(access_code, sizeof(access_code));
-            if (ret != PICOKEYS_OK) {
-                return SW_MEMORY_FAILURE();
-            }
+            if (otp_storage_finish(ret, true) != PICOKEYS_OK) return SW_MEMORY_FAILURE();
             uint8_t session = session_counter[slot1 - EF_OTP_SLOT1];
             session_counter[slot1 - EF_OTP_SLOT1] = session_counter[slot2 - EF_OTP_SLOT1];
             session_counter[slot2 - EF_OTP_SLOT1] = session;
@@ -994,7 +1049,7 @@ static int cmd_otp(void) {
         mbedtls_platform_zeroize(data1, sizeof(data1));
         mbedtls_platform_zeroize(data2, sizeof(data2));
         mbedtls_platform_zeroize(access_code, sizeof(access_code));
-        flash_commit();
+        if (otp_storage_finish(PICOKEYS_OK, true) != PICOKEYS_OK) return SW_MEMORY_FAILURE();
         uint8_t session = session_counter[slot1 - EF_OTP_SLOT1];
         session_counter[slot1 - EF_OTP_SLOT1] = session_counter[slot2 - EF_OTP_SLOT1];
         session_counter[slot2 - EF_OTP_SLOT1] = session;
@@ -1158,6 +1213,23 @@ static const cmd_t cmds[] = {
 };
 
 static int otp_process_apdu(void) {
+    bool ready = applet_txn_ready(&otp_txn);
+    if (!ready && CLA(apdu) == 0 && INS(apdu) == 0x04 && P1(apdu) == 0xde && P2(apdu) == 0xad && apdu.nc == 0) {
+        bool prior_force = force_button_wait;
+        force_button_wait = true;
+        bool touched = wait_button_pressed_timeout(15) == 0;
+        force_button_wait = prior_force;
+        if (!touched) return SW_SECURITY_STATUS_NOT_SATISFIED();
+        if (!applet_txn_recover_begin(&otp_txn)) return SW_MEMORY_FAILURE();
+        if (otp_storage_finish(otp_container_purge(), true) != PICOKEYS_OK) return SW_MEMORY_FAILURE();
+        memset(session_counter, 0, sizeof(session_counter));
+        config_seq = 0;
+        scanned = true;
+        return SW_OK();
+    }
+    if (!ready) return SW_MEMORY_FAILURE();
+    init_otp();
+    if (!scanned || !applet_txn_ready(&otp_txn)) return SW_MEMORY_FAILURE();
     if (CLA(apdu) != 0x00) {
         return SW_CLA_NOT_SUPPORTED();
     }
@@ -1179,7 +1251,7 @@ int otp_hid_command(uint8_t command, const uint8_t request[64], uint8_t response
     int result = otp_process_apdu();
     _is_otp = false;
     *response_len = apdu.rlen;
-    /* Do not retain the address of a stack-local header. */
-    apdu.header = NULL;
+    /* Do not retain the address of a stack-local header or response buffer. */
+    apdu = (struct apdu){0};
     return result;
 }

@@ -30,9 +30,9 @@ volatile uint16_t finished_data_size;
 uint8_t ITF_SC_CCID = 0, ITF_SC_WCID = 1;
 uint8_t ITF_HID_CTAP = 2;
 
-static file_t test_files[HSMAUTH_MAX_CREDS + 1];
-static uint8_t file_bytes[HSMAUTH_MAX_CREDS + 1][sizeof(hsmauth_cred_t) + APPLET_STORAGE_OVERHEAD];
-static size_t file_sizes[HSMAUTH_MAX_CREDS + 1];
+static file_t test_files[HSMAUTH_MAX_CREDS + 2];
+static uint8_t file_bytes[HSMAUTH_MAX_CREDS + 2][sizeof(hsmauth_cred_t) + APPLET_STORAGE_OVERHEAD];
+static size_t file_sizes[HSMAUTH_MAX_CREDS + 2];
 static struct {
     uint8_t before[16];
     uint8_t usb[USB_BUFFER_SIZE];
@@ -69,6 +69,7 @@ int wait_button_pressed_timeout(uint32_t seconds) { (void)seconds; return 0; }
 bool check_user_presence(void) { return true; }
 uint32_t button_timeout_seconds(void) { return 30; }
 void flash_commit(void) {}
+bool flash_commit_sync(uint32_t timeout_ms) { (void)timeout_ms; return true; }
 void timeout_stop(void) {}
 void otp_hid_execute_pending(void) {}
 void led_set_mode(uint32_t mode) { (void)mode; }

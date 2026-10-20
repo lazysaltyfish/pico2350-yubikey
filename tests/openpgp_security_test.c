@@ -11,8 +11,8 @@ picokey_serial_t pico_serial = {{1, 2, 3, 4, 5, 6, 7, 8}};
 
 struct apdu apdu;
 static uint8_t header[4], response[2048];
-static bool touch_allowed, rng_fail, read_fail, write_fail;
-static unsigned touches;
+static bool touch_allowed, rng_fail, read_fail, write_fail, sync_fail;
+static unsigned touches, sync_calls;
 static const uint8_t root_key[32] = {0x42};
 const uint8_t *otp_key_1 = root_key;
 typedef struct { file_t file; size_t len; uint8_t bytes[4096]; } test_file_t;
@@ -39,6 +39,11 @@ bool check_user_presence(void) { touches++; return touch_allowed; }
 int wait_button_pressed_timeout(uint32_t timeout) { (void)timeout; return check_user_presence() ? 0 : 1; }
 uint32_t button_timeout_seconds(void) { return 15; }
 void flash_commit(void) {}
+bool flash_commit_sync(uint32_t timeout_ms) {
+    assert(timeout_ms > 0);
+    sync_calls++;
+    return !sync_fail;
+}
 int random_fill_buffer(byte_array_t out) {
     static uint32_t state = 0x12345678;
     if (rng_fail) return PICOKEYS_EXEC_ERROR;
@@ -93,9 +98,10 @@ static int command(uint8_t ins, uint8_t p1, uint8_t p2, const void *data, size_t
 }
 static void reset_fixture(void) {
     openpgp_unload();
+    opgp_txn = (applet_txn_t)APPLET_TXN_INITIALIZER(EF_OPENPGP_TXN);
     memset(records, 0, sizeof(records)); num_records = 0;
-    rng_fail = read_fail = write_fail = false;
-    touch_allowed = true; touches = 0; otp_key_1 = root_key;
+    rng_fail = read_fail = write_fail = sync_fail = false;
+    touch_allowed = true; touches = sync_calls = 0; otp_key_1 = root_key;
 }
 static void assert_zero(const void *buf, size_t len) {
     const uint8_t *p = buf;
@@ -133,14 +139,21 @@ static void test_state_and_envelope_integrity(void) {
     otp_key_1 = NULL;
     assert(!opgp_load_state(&st));
     assert(!opgp_save_state(&st));
+    opgp_txn = (applet_txn_t)APPLET_TXN_INITIALIZER(EF_OPENPGP_TXN);
     otp_key_1 = root_key;
     rng_fail = true;
     assert(!opgp_save_state(&st));
     assert(memcmp(pristine, r->bytes, sizeof(pristine)) == 0);
+    opgp_txn = (applet_txn_t)APPLET_TXN_INITIALIZER(EF_OPENPGP_TXN);
     rng_fail = false;
     write_fail = true;
     assert(!opgp_save_state(&st));
+    opgp_txn = (applet_txn_t)APPLET_TXN_INITIALIZER(EF_OPENPGP_TXN);
     write_fail = false;
+    sync_fail = true;
+    assert(!opgp_save_state(&st));
+    opgp_txn = (applet_txn_t)APPLET_TXN_INITIALIZER(EF_OPENPGP_TXN);
+    sync_fail = false;
 }
 
 static void test_authenticated_keys_and_private_objects(void) {
@@ -221,10 +234,43 @@ static void test_reject_legacy_and_explicit_recovery(void) {
     assert(command(OPGP_INS_VERIFY, 0, 0x83, "12345678", 8) == 0x6400);
 }
 
+static void test_persistence_and_counter_faults(void) {
+    reset_fixture();
+    assert(command(OPGP_INS_VERIFY, 0, 0x83, "12345678", 8) == 0x9000);
+    static const uint8_t attr[] = {0x13,0x2A,0x86,0x48,0xCE,0x3D,0x03,0x01,0x07};
+    assert(command(OPGP_INS_PUT_DATA, 0, 0xC1, attr, sizeof(attr)) == 0x9000);
+    const uint8_t crt[] = {0xB6, 0};
+    assert(command(OPGP_INS_GENERATE_ASYM, 0x80, 0, crt, sizeof(crt)) == 0x9000);
+    assert(command(OPGP_INS_VERIFY, 0, 0x81, "123456", 6) == 0x9000);
+
+    /* Signature counter persistence failure must not release a signature. */
+    uint8_t digest[32]; memset(digest, 0x73, sizeof(digest));
+    sync_fail = true;
+    assert(command(OPGP_INS_PSO, 0x9E, 0x9A, digest, sizeof(digest)) == 0x6581);
+    assert(apdu.rlen == 0);
+    assert_zero(response, 64);
+    assert(opgp_txn.faulted);
+    sync_fail = false;
+    assert(command(OPGP_INS_GET_VERSION, 0, 0, NULL, 0) == 0x6400);
+
+    /* Interrupted multi-record transaction locks applet until touch reset. */
+    opgp_txn = (applet_txn_t)APPLET_TXN_INITIALIZER(EF_OPENPGP_TXN);
+    assert(applet_txn_begin(&opgp_txn));
+    opgp_txn = (applet_txn_t)APPLET_TXN_INITIALIZER(EF_OPENPGP_TXN);
+    assert(command(OPGP_INS_GET_VERSION, 0, 0, NULL, 0) == 0x6400);
+    touch_allowed = false;
+    assert(command(OPGP_INS_ACTIVATE, 0xDE, 0xAD, NULL, 0) == 0x6982);
+    touch_allowed = true;
+    assert(command(OPGP_INS_ACTIVATE, 0xDE, 0xAD, NULL, 0) == 0x9000);
+    opgp_txn = (applet_txn_t)APPLET_TXN_INITIALIZER(EF_OPENPGP_TXN);
+    assert(command(OPGP_INS_GET_VERSION, 0, 0, NULL, 0) == 0x9000);
+}
+
 int main(void) {
     test_state_and_envelope_integrity();
     test_authenticated_keys_and_private_objects();
     test_reject_legacy_and_explicit_recovery();
+    test_persistence_and_counter_faults();
     puts("openpgp_security_test: OK");
     return 0;
 }

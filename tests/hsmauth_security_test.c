@@ -13,12 +13,12 @@
 
 struct apdu apdu;
 static uint8_t header[4], response[2048];
-static bool rng_fail, touch_allowed;
+static bool rng_fail, touch_allowed, write_fail, sync_fail;
 static bool ec_rng;
-static unsigned touch_requests;
-static file_t files[HSMAUTH_MAX_CREDS + 1];
-static uint8_t file_bytes[HSMAUTH_MAX_CREDS + 1][sizeof(hsmauth_cred_t) + APPLET_STORAGE_OVERHEAD];
-static size_t file_sizes[HSMAUTH_MAX_CREDS + 1];
+static unsigned touch_requests, sync_calls;
+static file_t files[HSMAUTH_MAX_CREDS + 2];
+static uint8_t file_bytes[HSMAUTH_MAX_CREDS + 2][sizeof(hsmauth_cred_t) + APPLET_STORAGE_OVERHEAD];
+static size_t file_sizes[HSMAUTH_MAX_CREDS + 2];
 
 uint16_t set_res_sw(uint8_t sw1, uint8_t sw2) {
     apdu.sw = make_uint16_be(sw1, sw2);
@@ -48,6 +48,11 @@ bool check_user_presence(void) { touch_requests++; return touch_allowed; }
 int wait_button_pressed_timeout(uint32_t seconds) { (void)seconds; return check_user_presence() ? 0 : 1; }
 uint32_t button_timeout_seconds(void) { return 15; }
 void flash_commit(void) {}
+bool flash_commit_sync(uint32_t timeout_ms) {
+    assert(timeout_ms > 0);
+    sync_calls++;
+    return !sync_fail;
+}
 file_t *file_search(uint16_t fid) {
     for (size_t i = 0; i < sizeof(files) / sizeof(files[0]); i++) if (files[i].fid == fid) return &files[i];
     return NULL;
@@ -66,6 +71,7 @@ uint32_t file_get_size(const file_t *f) { return (uint32_t)file_sizes[f - files]
 bool file_has_data(const file_t *f) { return f && file_get_size(f) != 0; }
 uint8_t *file_get_data(const file_t *f) { return f->data; }
 int file_put_data(file_t *f, const_byte_array_t bytes) {
+    if (write_fail) return PICOKEYS_EXEC_ERROR;
     assert(bytes.len <= sizeof(file_bytes[0]));
     memcpy(f->data, bytes.data, bytes.len);
     file_sizes[f - files] = bytes.len;
@@ -138,9 +144,11 @@ static void begin(uint8_t label, bool asymmetric) {
 }
 static void reset_fixture(void) {
     hsmauth_unload();
+    hsmauth_txn = (applet_txn_t)APPLET_TXN_INITIALIZER(EF_HSMAUTH_TXN);
     memset(files, 0, sizeof(files));
     memset(file_sizes, 0, sizeof(file_sizes));
-    rng_fail = false;
+    rng_fail = write_fail = sync_fail = false;
+    sync_calls = 0;
     hsmauth_state_t initial_state;
     hsmauth_default_state(&initial_state);
     assert(hsmauth_save_state(&initial_state));
@@ -372,11 +380,39 @@ static void test_authenticated_storage_and_recovery(void) {
     assert(command(HSMAUTH_INS_GET_VERSION, NULL, 0) == 0x6400);
 }
 
+static void test_persistence_and_transaction_faults(void) {
+    uint8_t ctx[16], proof[8], expected[48];
+    aes_vectors(ctx, proof, expected);
+    reset_fixture();
+
+    /* Retry decrements and resets must be durable before releasing keys. */
+    sync_fail = true;
+    assert(calculate('a', ctx, 16, NULL, proof, 8) == 0x6581);
+    assert(hsmauth_txn.faulted);
+    sync_fail = false;
+    assert(command(HSMAUTH_INS_GET_VERSION, NULL, 0) == 0x6400);
+
+    /* Simulated reboot with clean marker restores service; multi-record
+     * interruption leaves a dirty marker requiring touch-gated reset. */
+    hsmauth_txn = (applet_txn_t)APPLET_TXN_INITIALIZER(EF_HSMAUTH_TXN);
+    assert(command(HSMAUTH_INS_GET_VERSION, NULL, 0) == 0x9000);
+    assert(applet_txn_begin(&hsmauth_txn));
+    hsmauth_txn = (applet_txn_t)APPLET_TXN_INITIALIZER(EF_HSMAUTH_TXN);
+    assert(command(HSMAUTH_INS_GET_VERSION, NULL, 0) == 0x6400);
+    touch_allowed = false;
+    assert(reset_applet() == 0x6982);
+    touch_allowed = true;
+    assert(reset_applet() == 0x9000);
+    hsmauth_txn = (applet_txn_t)APPLET_TXN_INITIALIZER(EF_HSMAUTH_TXN);
+    assert(command(HSMAUTH_INS_GET_VERSION, NULL, 0) == 0x9000);
+}
+
 int main(void) {
     test_symmetric_peer_proof();
     test_asymmetric_receipt_and_binding();
     test_failure_and_lifecycle_consumption();
     test_authenticated_storage_and_recovery();
+    test_persistence_and_transaction_faults();
     puts("hsmauth_security_test: OK");
     return 0;
 }

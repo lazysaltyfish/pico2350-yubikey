@@ -343,14 +343,9 @@ int oath_container_delete(uint8_t slot) {
 }
 
 int oath_container_purge(uint8_t slot) {
-    if (!oath_container_is_marker(file_search((uint16_t)(EF_OATH_CRED + slot)))) {
-        return PICOKEYS_ERR_FILE_NOT_FOUND;
-    }
     for (uint8_t manifest_slot = 0; manifest_slot < FILE_OBJECT_CONTAINER_SLOT_COUNT; manifest_slot++) {
         file_t *manifest = file_search(oath_manifest_fid(slot, manifest_slot));
-        if (manifest) {
-            file_delete_no_commit(manifest);
-        }
+        if (manifest && file_delete_no_commit(manifest) != PICOKEYS_OK) return PICOKEYS_EXEC_ERROR;
     }
     int r = oath_layout_deactivate(NULL, slot);
     if (r != PICOKEYS_OK) {

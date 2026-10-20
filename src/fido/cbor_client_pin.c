@@ -366,9 +366,11 @@ static int check_keydev_encrypted(const uint8_t pin_token[32]) {
             mbedtls_platform_zeroize(tmp_keydev, sizeof(tmp_keydev));
             return ret;
         }
-        file_put_data(ef_keydev, CONST_BYTE_ARRAY(tmp_keydev, sizeof(tmp_keydev)));
+        ret = file_put_data(ef_keydev, CONST_BYTE_ARRAY(tmp_keydev, sizeof(tmp_keydev)));
         mbedtls_platform_zeroize(tmp_keydev, sizeof(tmp_keydev));
-        flash_commit();
+        if (ret != PICOKEYS_OK || !flash_commit_sync(PIN_RETRY_COMMIT_TIMEOUT_MS)) {
+            return CTAP2_ERR_PROCESSING;
+        }
         keydev_unlocked = true;
     }
     return PICOKEYS_OK;
@@ -590,8 +592,11 @@ int cbor_client_pin(const uint8_t *data, size_t len) {
         mbedtls_md(mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), paddedNewPin, pin_byte_len, dhash);
         mbedtls_platform_zeroize(paddedNewPin, sizeof(paddedNewPin));
         pin_derive_verifier(CONST_BYTE_ARRAY(dhash, 16), hsh + 3);
-        file_put_data(ef_pin, CONST_BYTE_ARRAY(hsh, sizeof(hsh)));
-        flash_commit();
+        if (!persist_pin_retry_counter(ef_pin, hsh, sizeof(hsh))) {
+            mbedtls_platform_zeroize(hsh, sizeof(hsh));
+            mbedtls_platform_zeroize(dhash, sizeof(dhash));
+            CBOR_ERROR(CTAP2_ERR_PROCESSING);
+        }
 
         pin_derive_session(CONST_BYTE_ARRAY(dhash, 16), session_pin);
         ret = check_keydev_encrypted(session_pin);
@@ -734,8 +739,9 @@ int cbor_client_pin(const uint8_t *data, size_t len) {
         }
         pin_derive_session(CONST_BYTE_ARRAY(paddedNewPin, 16), session_pin);
         pin_data[0] = MAX_PIN_RETRIES;
-        file_put_data(ef_pin, CONST_BYTE_ARRAY(pin_data, sizeof(pin_data)));
-        flash_commit();
+        if (!persist_pin_retry_counter(ef_pin, pin_data, sizeof(pin_data))) {
+            CBOR_ERROR(CTAP2_ERR_PROCESSING);
+        }
 
         ret = check_keydev_encrypted(session_pin);
         if (ret != PICOKEYS_OK) {
@@ -772,41 +778,55 @@ int cbor_client_pin(const uint8_t *data, size_t len) {
             CBOR_ERROR(CTAP2_ERR_PIN_POLICY_VIOLATION);
         }
 
-        // New PIN is valid and verified
-        ret = load_keydev(keydev);
-        if (ret != PICOKEYS_OK) {
-            CBOR_ERROR(CTAP2_ERR_PIN_INVALID);
-        }
-        encrypt_keydev_f1(keydev);
-
         mbedtls_md(mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), paddedNewPin, pin_byte_len, dhash);
-        pin_derive_session(CONST_BYTE_ARRAY(dhash, 16), session_pin);
-        ret = check_keydev_encrypted(session_pin);
-        if (ret != PICOKEYS_OK) {
-            CBOR_ERROR(ret);
-        }
-        flash_commit();
-
         pin_data[0] = MAX_PIN_RETRIES;
         pin_data[1] = (uint8_t)pin_codepoints;
         pin_data[2] = 1; // New format indicator
         pin_derive_verifier(CONST_BYTE_ARRAY(dhash, 16), pin_data + 3);
 
         if (minpin_record_has_header(ef_minpin) && file_get_data(ef_minpin)[1] == 1 && mbedtls_ct_memcmp(pin_data + 3, file_get_data(ef_pin) + 3, 32) == 0) {
+            mbedtls_platform_zeroize(pin_data, sizeof(pin_data));
+            mbedtls_platform_zeroize(dhash, sizeof(dhash));
             CBOR_ERROR(CTAP2_ERR_PIN_POLICY_VIOLATION);
         }
-        file_put_data(ef_pin, CONST_BYTE_ARRAY(pin_data, sizeof(pin_data)));
+
+        // New PIN is valid and verified
+        ret = load_keydev(keydev);
+        if (ret != PICOKEYS_OK) {
+            mbedtls_platform_zeroize(pin_data, sizeof(pin_data));
+            mbedtls_platform_zeroize(dhash, sizeof(dhash));
+            CBOR_ERROR(CTAP2_ERR_PIN_INVALID);
+        }
+        encrypt_keydev_f1(keydev);
+
+        pin_derive_session(CONST_BYTE_ARRAY(dhash, 16), session_pin);
+        ret = check_keydev_encrypted(session_pin);
+        if (ret != PICOKEYS_OK) {
+            mbedtls_platform_zeroize(pin_data, sizeof(pin_data));
+            mbedtls_platform_zeroize(dhash, sizeof(dhash));
+            CBOR_ERROR(ret);
+        }
+        if (!persist_pin_retry_counter(ef_pin, pin_data, sizeof(pin_data))) {
+            mbedtls_platform_zeroize(pin_data, sizeof(pin_data));
+            mbedtls_platform_zeroize(dhash, sizeof(dhash));
+            CBOR_ERROR(CTAP2_ERR_PROCESSING);
+        }
 
         mbedtls_platform_zeroize(pin_data, sizeof(pin_data));
         mbedtls_platform_zeroize(dhash, sizeof(dhash));
         if (minpin_record_has_header(ef_minpin) && file_get_data(ef_minpin)[1] == 1) {
             uint8_t *tmpf = (uint8_t *) calloc(1, file_get_size(ef_minpin));
+            if (!tmpf) {
+                CBOR_ERROR(CTAP2_ERR_PROCESSING);
+            }
             memcpy(tmpf, file_get_data(ef_minpin), file_get_size(ef_minpin));
             tmpf[1] = 0;
-            file_put_data(ef_minpin, CONST_BYTE_ARRAY(tmpf, file_get_size(ef_minpin)));
+            int minpin_ret = file_put_data(ef_minpin, CONST_BYTE_ARRAY(tmpf, file_get_size(ef_minpin)));
             free(tmpf);
+            if (minpin_ret != PICOKEYS_OK || !flash_commit_sync(PIN_RETRY_COMMIT_TIMEOUT_MS)) {
+                CBOR_ERROR(CTAP2_ERR_PROCESSING);
+            }
         }
-        flash_commit();
         resetPinUvAuthToken();
         resetPersistentPinUvAuthToken();
         needs_power_cycle = false;
@@ -944,10 +964,11 @@ int cbor_client_pin(const uint8_t *data, size_t len) {
         pin_data[0] = MAX_PIN_RETRIES;
         new_pin_mismatches = 0;
 
-        file_put_data(ef_pin, CONST_BYTE_ARRAY(pin_data, sizeof(pin_data)));
+        if (!persist_pin_retry_counter(ef_pin, pin_data, sizeof(pin_data))) {
+            mbedtls_platform_zeroize(pin_data, sizeof(pin_data));
+            CBOR_ERROR(CTAP2_ERR_PROCESSING);
+        }
         mbedtls_platform_zeroize(pin_data, sizeof(pin_data));
-
-        flash_commit();
         file_t *ef_minpin = file_search_by_fid(EF_MINPINLEN, NULL, SPECIFY_EF);
         if (minpin_force_change_pending(ef_minpin)) {
             if (subcommand == 0x09 && permissions == CTAP_PERMISSION_ACFG && rpId.present == false) {

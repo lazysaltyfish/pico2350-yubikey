@@ -292,7 +292,7 @@ if(ENABLE_EMULATION)
     find_package(Python3 REQUIRED COMPONENTS Interpreter)
     add_test(NAME verification_runner_test COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_LIST_DIR}/tests/verification_runner_test.py")
 
-    add_executable(hsmauth_security_test tests/hsmauth_security_test.c src/fido/applet_storage.c)
+    add_executable(hsmauth_security_test tests/hsmauth_security_test.c src/fido/applet_storage.c src/fido/applet_txn.c)
     target_include_directories(hsmauth_security_test PRIVATE ${INCLUDES} ${SYSTEM_INCLUDES})
     target_compile_options(hsmauth_security_test PRIVATE -Wall -Wextra -Wshadow -Werror -UNDEBUG)
     target_link_libraries(hsmauth_security_test PRIVATE mbedtls)
@@ -304,13 +304,13 @@ if(ENABLE_EMULATION)
     target_link_libraries(fido_client_pin_test PRIVATE mbedtls tinycbor)
     add_test(NAME fido_client_pin_test COMMAND fido_client_pin_test)
 
-    add_executable(piv_security_test tests/piv_security_test.c src/tlv.c)
+    add_executable(piv_security_test tests/piv_security_test.c src/tlv.c src/fido/applet_storage.c src/fido/applet_txn.c)
     target_include_directories(piv_security_test PRIVATE ${INCLUDES} ${SYSTEM_INCLUDES})
     target_compile_options(piv_security_test PRIVATE -Wall -Wextra -Werror)
     target_link_libraries(piv_security_test PRIVATE mbedtls)
     add_test(NAME piv_security_test COMMAND piv_security_test)
 
-    add_executable(hsmauth_list_test tests/hsmauth_list_test.c src/fido/applet_storage.c)
+    add_executable(hsmauth_list_test tests/hsmauth_list_test.c src/fido/applet_storage.c src/fido/applet_txn.c)
     target_include_directories(hsmauth_list_test BEFORE PRIVATE tests/support/include)
     target_include_directories(hsmauth_list_test PRIVATE ${INCLUDES} ${SYSTEM_INCLUDES})
     target_compile_options(hsmauth_list_test PRIVATE -Wall -Wextra -Wshadow -Werror)
@@ -336,7 +336,29 @@ if(ENABLE_EMULATION)
     target_link_libraries(securitydomain_security_test PRIVATE mbedtls)
     add_test(NAME securitydomain_security_test COMMAND securitydomain_security_test)
 
-    add_executable(openpgp_security_test tests/openpgp_security_test.c src/fido/applet_storage.c)
+    add_executable(sign_counter_test tests/sign_counter_test.c)
+    target_include_directories(sign_counter_test PRIVATE ${INCLUDES})
+    target_compile_options(sign_counter_test PRIVATE -Wall -Wextra -Wshadow -Werror -UNDEBUG)
+    target_link_libraries(sign_counter_test PRIVATE mbedtls)
+    add_test(NAME sign_counter_test COMMAND sign_counter_test)
+
+    add_executable(oath_otp_persistence_test
+        tests/oath_otp_persistence_test.c
+        tests/support/counters/fixture.c
+        src/fido/oath_put.c
+        src/fido/applet_storage.c
+        src/fido/applet_txn.c
+        src/tlv.c
+        src/crypto_utils.c
+    )
+    target_include_directories(oath_otp_persistence_test BEFORE PRIVATE tests/support/counters/include)
+    target_include_directories(oath_otp_persistence_test PRIVATE ${INCLUDES} ${SYSTEM_INCLUDES})
+    target_compile_definitions(oath_otp_persistence_test PRIVATE PICO_PLATFORM=1)
+    target_compile_options(oath_otp_persistence_test PRIVATE -Wall -Wextra -Wshadow -Werror -UNDEBUG)
+    target_link_libraries(oath_otp_persistence_test PRIVATE mbedtls)
+    add_test(NAME oath_otp_persistence_test COMMAND oath_otp_persistence_test)
+
+    add_executable(openpgp_security_test tests/openpgp_security_test.c src/fido/applet_storage.c src/fido/applet_txn.c)
     target_include_directories(openpgp_security_test PRIVATE ${INCLUDES} ${SYSTEM_INCLUDES})
     target_compile_options(openpgp_security_test PRIVATE -Wall -Wextra -Wshadow -Werror -UNDEBUG)
     target_link_libraries(openpgp_security_test PRIVATE mbedtls)
@@ -502,7 +524,9 @@ else()
         ${CMAKE_CURRENT_LIST_DIR}/src/vault.c
         ${CMAKE_CURRENT_LIST_DIR}/config/rp2350/alt/sha256_alt.c
         ${CMAKE_CURRENT_LIST_DIR}/src/fido/fido.c
+        ${CMAKE_CURRENT_LIST_DIR}/src/fido/sign_counter.c
         ${CMAKE_CURRENT_LIST_DIR}/src/fido/applet_storage.c
+        ${CMAKE_CURRENT_LIST_DIR}/src/fido/applet_txn.c
         ${CMAKE_CURRENT_LIST_DIR}/src/fido/object_authorization.c
         ${CMAKE_CURRENT_LIST_DIR}/src/fido/object_provider.c
         ${CMAKE_CURRENT_LIST_DIR}/src/fido/resident_container.c

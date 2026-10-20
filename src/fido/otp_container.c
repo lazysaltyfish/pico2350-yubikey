@@ -438,6 +438,23 @@ int otp_container_write_slot(uint8_t slot, const uint8_t *data, size_t data_size
     return r;
 }
 
+int otp_container_purge(void) {
+    for (uint8_t bank = 0; bank < FILE_OBJECT_CONTAINER_SLOT_COUNT; bank++) {
+        file_t *file = file_search(otp_manifest_fid(bank));
+        if (file && file_delete_no_commit(file) != PICOKEYS_OK) return PICOKEYS_EXEC_ERROR;
+        for (uint8_t index = 0; index < FIDO_OTP_RECORD_COUNT; index++) {
+            uint16_t fid = (bank == 0 ? FIDO_OTP_RECORD_PREFIX_0 : FIDO_OTP_RECORD_PREFIX_1) | index;
+            file = file_search(fid);
+            if (file && file_delete_no_commit(file) != PICOKEYS_OK) return PICOKEYS_EXEC_ERROR;
+        }
+    }
+    for (uint8_t slot = 0; slot < FIDO_OTP_SLOT_COUNT; slot++) {
+        file_t *file = file_search((uint16_t)(EF_OTP_SLOT1 + slot));
+        if (file && file_delete_no_commit(file) != PICOKEYS_OK) return PICOKEYS_EXEC_ERROR;
+    }
+    return PICOKEYS_OK;
+}
+
 int otp_container_delete_slot(uint8_t slot) {
     bool present = false;
     int r = otp_container_has_slot_status(slot, &present);
