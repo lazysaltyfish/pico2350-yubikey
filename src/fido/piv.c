@@ -321,28 +321,78 @@ static void piv_state_init_defaults(piv_state_t *st) {
     memcpy(st->mgm_key, piv_default_mgm, 24);
 }
 
+static bool piv_has_persisted_material(void) {
+    for (uint16_t i = 0; i < PIV_SLOT_COUNT; i++) {
+        if (file_has_data(file_search((uint16_t)(EF_PIV_KEY_BASE + i)))) {
+            return true;
+        }
+    }
+    for (uint16_t i = 0; i < PIV_OBJECT_COUNT; i++) {
+        if (file_has_data(file_search((uint16_t)(EF_PIV_OBJ_BASE + i)))) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool piv_state_is_valid(const piv_state_t *st) {
+    uint8_t expected_mgm_len;
+    switch (st->mgm_type) {
+        case PIV_ALG_3DES:
+        case PIV_ALG_AES192:
+            expected_mgm_len = 24;
+            break;
+        case PIV_ALG_AES128:
+            expected_mgm_len = 16;
+            break;
+        case PIV_ALG_AES256:
+            expected_mgm_len = 32;
+            break;
+        default:
+            return false;
+    }
+    return st->magic == PIV_STATE_MAGIC &&
+           st->max_pin_retries > 0 && st->pin_retries <= st->max_pin_retries &&
+           st->max_puk_retries > 0 && st->puk_retries <= st->max_puk_retries &&
+           st->pin_is_default <= 1 && st->puk_is_default <= 1 && st->mgm_is_default <= 1 &&
+           st->mgm_len == expected_mgm_len &&
+           st->mgm_touch_policy >= PIV_TOUCH_POLICY_NEVER &&
+           st->mgm_touch_policy <= PIV_TOUCH_POLICY_CACHED;
+}
+
 static int piv_load_state(piv_state_t *st) {
-    piv_state_init_defaults(st);
+    /* Never leave default credentials in the output of a failed load. */
+    memset(st, 0, sizeof(*st));
     file_t *ef = file_search(EF_PIV_STATE);
     if (!file_has_data(ef)) {
+        /* EF_PIV_STATE is a static file, so its handle also exists on a
+         * virgin device. Missing data is safe only without prior material. */
+        if (piv_has_persisted_material()) {
+            return PICOKEYS_EXEC_ERROR;
+        }
+        piv_state_init_defaults(st);
         return PICOKEYS_OK;
     }
     uint32_t sz = file_get_size(ef);
     if (sz != sizeof(piv_state_t) + PIV_SECURE_OVERHEAD) {
-        return PICOKEYS_OK;
+        return PICOKEYS_EXEC_ERROR;
     }
     uint8_t mkey[32];
     if (piv_derive_master_key(mkey) != PICOKEYS_OK) {
+        mbedtls_platform_zeroize(mkey, sizeof(mkey));
         return PICOKEYS_EXEC_ERROR;
     }
-    piv_state_t tmp;
+    piv_state_t tmp = { 0 };
     int ret = decrypt_with_aad(mkey, CONST_BYTE_ARRAY(file_get_data(ef), sz), PIN_KDF_V2, (uint8_t *)&tmp);
     mbedtls_platform_zeroize(mkey, sizeof(mkey));
-    if (ret == PICOKEYS_OK && tmp.magic == PIV_STATE_MAGIC) {
+    if (ret == PICOKEYS_OK && piv_state_is_valid(&tmp)) {
         memcpy(st, &tmp, sizeof(*st));
     }
+    else {
+        ret = PICOKEYS_EXEC_ERROR;
+    }
     mbedtls_platform_zeroize(&tmp, sizeof(tmp));
-    return PICOKEYS_OK;
+    return ret;
 }
 
 static int piv_save_state(const piv_state_t *st) {
@@ -631,7 +681,9 @@ static int cmd_piv_verify(void) {
         return SW_INCORRECT_P1P2();
     }
     piv_state_t st;
-    piv_load_state(&st);
+    if (piv_load_state(&st) != PICOKEYS_OK) {
+        return SW_EXEC_ERROR();
+    }
 
     if (p1 == 0xFF) {
         if (apdu.nc != 0) {
@@ -694,7 +746,9 @@ static int cmd_piv_change_reference(void) {
     const uint8_t *new_val = apdu.data + PIV_PIN_LEN;
 
     piv_state_t st;
-    piv_load_state(&st);
+    if (piv_load_state(&st) != PICOKEYS_OK) {
+        return SW_EXEC_ERROR();
+    }
 
     if (p2 == PIV_PIN_P2) {
         if (st.pin_retries == 0) {
@@ -755,7 +809,9 @@ static int cmd_piv_reset_retry(void) {
     const uint8_t *new_pin = apdu.data + PIV_PIN_LEN;
 
     piv_state_t st;
-    piv_load_state(&st);
+    if (piv_load_state(&st) != PICOKEYS_OK) {
+        return SW_EXEC_ERROR();
+    }
     if (st.puk_retries == 0) {
         mbedtls_platform_zeroize(&st, sizeof(st));
         return SW_PIN_BLOCKED();
@@ -790,7 +846,9 @@ static int cmd_piv_set_pin_retries(void) {
         return SW_INCORRECT_P1P2();
     }
     piv_state_t st;
-    piv_load_state(&st);
+    if (piv_load_state(&st) != PICOKEYS_OK) {
+        return SW_EXEC_ERROR();
+    }
     memcpy(st.pin, piv_default_pin, PIV_PIN_LEN);
     memcpy(st.puk, piv_default_puk, PIV_PIN_LEN);
     st.max_pin_retries = pin_att;
@@ -809,7 +867,9 @@ static int cmd_piv_reset(void) {
         return SW_INCORRECT_P1P2();
     }
     piv_state_t st;
-    piv_load_state(&st);
+    if (piv_load_state(&st) != PICOKEYS_OK) {
+        return SW_EXEC_ERROR();
+    }
     if (st.pin_retries > 0 || st.puk_retries > 0) {
         mbedtls_platform_zeroize(&st, sizeof(st));
         return SW_CONDITIONS_NOT_SATISFIED();
@@ -895,7 +955,9 @@ static int cmd_piv_set_mgmkey(void) {
         return SW_WRONG_DATA();
     }
     piv_state_t st;
-    piv_load_state(&st);
+    if (piv_load_state(&st) != PICOKEYS_OK) {
+        return SW_EXEC_ERROR();
+    }
     st.mgm_type = alg;
     st.mgm_len = key_len;
     st.mgm_touch_policy = (P2(apdu) == 0xFE) ? PIV_TOUCH_POLICY_ALWAYS : PIV_TOUCH_POLICY_NEVER;
@@ -916,7 +978,9 @@ static int cmd_piv_get_metadata(void) {
         return SW_REFERENCE_NOT_FOUND();
     }
     piv_state_t st;
-    piv_load_state(&st);
+    if (piv_load_state(&st) != PICOKEYS_OK) {
+        return SW_EXEC_ERROR();
+    }
     uint8_t *p = res_APDU;
 
     if (p2 == PIV_PIN_P2 || p2 == PIV_PUK_P2) {
@@ -2011,6 +2075,20 @@ static int piv_process_apdu(void) {
     }
     for (const cmd_t *cmd = piv_cmds; cmd->ins != 0x00; cmd++) {
         if (cmd->ins == INS(apdu)) {
+            piv_state_t st;
+            if (piv_load_state(&st) != PICOKEYS_OK) {
+                piv_unload();
+                return SW_EXEC_ERROR();
+            }
+            /* Bind freshly created keys and objects to a persisted policy
+             * before entering any handler, including lazy F9 generation. */
+            bool fresh = !file_has_data(file_search(EF_PIV_STATE));
+            int ret = fresh ? piv_save_state(&st) : PICOKEYS_OK;
+            mbedtls_platform_zeroize(&st, sizeof(st));
+            if (ret != PICOKEYS_OK) {
+                piv_unload();
+                return SW_MEMORY_FAILURE();
+            }
             return cmd->cmd_handler();
         }
     }
