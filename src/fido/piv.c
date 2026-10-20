@@ -178,10 +178,25 @@ static const uint8_t piv_aid[] = {
 static bool piv_pin_verified = false;
 static bool piv_pin_verified_once_used = false;
 static bool piv_mgm_authenticated = false;
-static bool piv_mgm_challenge_valid = false;
+typedef enum {
+    PIV_MGM_AUTH_IDLE,
+    PIV_MGM_AUTH_SINGLE,
+    PIV_MGM_AUTH_MUTUAL,
+} piv_mgm_auth_state_t;
+
+static piv_mgm_auth_state_t piv_mgm_auth_state = PIV_MGM_AUTH_IDLE;
+static uint8_t piv_mgm_challenge_alg = 0;
 static uint8_t piv_mgm_challenge[16] = { 0 };
 static uint8_t piv_mgm_challenge_len = 0;
 static uint32_t piv_last_touch_ms = 0;
+
+static void piv_mgm_clear_auth(void) {
+    piv_mgm_authenticated = false;
+    piv_mgm_auth_state = PIV_MGM_AUTH_IDLE;
+    piv_mgm_challenge_alg = 0;
+    piv_mgm_challenge_len = 0;
+    mbedtls_platform_zeroize(piv_mgm_challenge, sizeof(piv_mgm_challenge));
+}
 
 static int piv_process_apdu(void);
 static int piv_unload(void);
@@ -551,8 +566,7 @@ static int piv_select(app_t *a, uint8_t force) {
     a->unload = piv_unload;
     piv_pin_verified = false;
     piv_pin_verified_once_used = false;
-    piv_mgm_authenticated = false;
-    piv_mgm_challenge_valid = false;
+    piv_mgm_clear_auth();
     piv_last_touch_ms = 0;
 
     static const uint8_t select_resp[] = {
@@ -571,8 +585,7 @@ static int piv_select(app_t *a, uint8_t force) {
 static int piv_unload(void) {
     piv_pin_verified = false;
     piv_pin_verified_once_used = false;
-    piv_mgm_authenticated = false;
-    piv_mgm_challenge_valid = false;
+    piv_mgm_clear_auth();
     piv_last_touch_ms = 0;
     return PICOKEYS_OK;
 }
@@ -818,8 +831,7 @@ static int cmd_piv_reset(void) {
     mbedtls_platform_zeroize(&st, sizeof(st));
     piv_pin_verified = false;
     piv_pin_verified_once_used = false;
-    piv_mgm_authenticated = false;
-    piv_mgm_challenge_valid = false;
+    piv_mgm_clear_auth();
     return SW_OK();
 }
 
@@ -1401,128 +1413,177 @@ static int piv_encode_ecdsa_der(const mbedtls_mpi *r, const mbedtls_mpi *s, uint
     return 0;
 }
 
+/* Management authentication only accepts complete, unambiguous BER-TLVs.
+ * The general TLV walker also accepts OATH's trailing lengthless markers. */
+static bool piv_auth_read_tlv(const uint8_t **cursor, const uint8_t *end,
+                              uint8_t *tag, tlv_ctx_t *value) {
+    const uint8_t *p = *cursor;
+    if ((size_t)(end - p) < 2) {
+        return false;
+    }
+    *tag = *p++;
+    size_t len = *p++;
+    if (len >= 0x80) {
+        size_t bytes = len & 0x7F;
+        if (bytes == 0 || bytes > 2 || (size_t)(end - p) < bytes) {
+            return false;
+        }
+        len = 0;
+        while (bytes-- > 0) {
+            len = (len << 8) | *p++;
+        }
+    }
+    if (len > (size_t)(end - p)) {
+        return false;
+    }
+    value->data = (uint8_t *)p;
+    value->len = len;
+    *cursor = p + len;
+    return true;
+}
+
+static int cmd_piv_authenticate_management(uint8_t alg) {
+    piv_mgm_auth_state_t pending = piv_mgm_auth_state;
+    uint8_t pending_alg = piv_mgm_challenge_alg;
+    uint8_t pending_len = piv_mgm_challenge_len;
+    uint8_t challenge[sizeof(piv_mgm_challenge)];
+    memcpy(challenge, piv_mgm_challenge, sizeof(challenge));
+    /* Every attempt consumes the previous challenge, including malformed
+     * commands, algorithm changes, crypto failures and denied touch. */
+    piv_mgm_clear_auth();
+
+    piv_state_t st = { 0 };
+    uint8_t cryptogram[16] = { 0 };
+    int sw = SW_WRONG_DATA();
+    if (!apdu.data || apdu.nc < 2) {
+        goto cleanup;
+    }
+    const uint8_t *cursor = apdu.data;
+    const uint8_t *end = apdu.data + apdu.nc;
+    uint8_t tag;
+    tlv_ctx_t dyn;
+    if (!piv_auth_read_tlv(&cursor, end, &tag, &dyn) ||
+        tag != TAG_DYN_AUTH || cursor != end) {
+        goto cleanup;
+    }
+
+    bool has_witness = false, has_challenge = false, has_response = false;
+    tlv_ctx_t t_wit = { 0 }, t_chal = { 0 }, t_resp = { 0 };
+    cursor = dyn.data;
+    end = dyn.data + dyn.len;
+    while (cursor < end) {
+        tlv_ctx_t value;
+        if (!piv_auth_read_tlv(&cursor, end, &tag, &value)) {
+            goto cleanup;
+        }
+        if (tag == TAG_AUTH_WITNESS && !has_witness) {
+            has_witness = true;
+            t_wit = value;
+        }
+        else if (tag == TAG_AUTH_CHALLENGE && !has_challenge) {
+            has_challenge = true;
+            t_chal = value;
+        }
+        else if (tag == TAG_AUTH_RESPONSE && !has_response) {
+            has_response = true;
+            t_resp = value;
+        }
+        else {
+            goto cleanup;
+        }
+    }
+
+    if (piv_load_state(&st) != PICOKEYS_OK) {
+        sw = SW_EXEC_ERROR();
+        goto cleanup;
+    }
+    if (alg != st.mgm_type) {
+        sw = SW_INCORRECT_P1P2();
+        goto cleanup;
+    }
+    uint8_t block_len = (alg == PIV_ALG_3DES) ? 8 : 16;
+    bool start_mutual = has_witness && t_wit.len == 0 && !has_challenge && !has_response;
+    bool start_single = has_challenge && t_chal.len == 0 && !has_witness && !has_response;
+    if (start_mutual || start_single) {
+        if (random_fill_buffer(BYTE_ARRAY(challenge, block_len)) != PICOKEYS_OK) {
+            sw = SW_EXEC_ERROR();
+            goto cleanup;
+        }
+        if (start_mutual && piv_mgm_ecb_crypt(&st, true, challenge, cryptogram) != 0) {
+            sw = SW_EXEC_ERROR();
+            goto cleanup;
+        }
+        memcpy(piv_mgm_challenge, challenge, block_len);
+        piv_mgm_challenge_len = block_len;
+        piv_mgm_challenge_alg = alg;
+        piv_mgm_auth_state = start_mutual ? PIV_MGM_AUTH_MUTUAL : PIV_MGM_AUTH_SINGLE;
+
+        uint8_t inner_tlv[20];
+        uint8_t *ip = piv_append_tlv(inner_tlv,
+                                    start_mutual ? TAG_AUTH_WITNESS : TAG_AUTH_CHALLENGE,
+                                    start_mutual ? cryptogram : challenge, block_len);
+        uint8_t *rp = piv_append_tlv(res_APDU, TAG_DYN_AUTH, inner_tlv, (size_t)(ip - inner_tlv));
+        res_APDU_size = (uint16_t)(rp - res_APDU);
+        sw = SW_OK();
+        goto cleanup;
+    }
+
+    bool finish_mutual = has_witness && t_wit.len == block_len &&
+                         has_challenge && t_chal.len == block_len && !has_response;
+    bool finish_single = has_response && t_resp.len == block_len && !has_witness && !has_challenge;
+    if (!finish_mutual && !finish_single) {
+        goto cleanup;
+    }
+    if (pending_alg != alg || pending_len != block_len ||
+        pending != (finish_mutual ? PIV_MGM_AUTH_MUTUAL : PIV_MGM_AUTH_SINGLE)) {
+        sw = SW_SECURITY_STATUS_NOT_SATISFIED();
+        goto cleanup;
+    }
+    if (finish_mutual) {
+        if (mbedtls_ct_memcmp(t_wit.data, challenge, block_len) != 0) {
+            sw = SW_SECURITY_STATUS_NOT_SATISFIED();
+            goto cleanup;
+        }
+    }
+    else if (piv_mgm_ecb_crypt(&st, true, challenge, cryptogram) != 0 ||
+             mbedtls_ct_memcmp(t_resp.data, cryptogram, block_len) != 0) {
+        sw = SW_SECURITY_STATUS_NOT_SATISFIED();
+        goto cleanup;
+    }
+    if (!piv_check_touch(st.mgm_touch_policy)) {
+        sw = SW_SECURITY_STATUS_NOT_SATISFIED();
+        goto cleanup;
+    }
+    if (finish_mutual) {
+        if (piv_mgm_ecb_crypt(&st, true, t_chal.data, cryptogram) != 0) {
+            sw = SW_EXEC_ERROR();
+            goto cleanup;
+        }
+        uint8_t inner_tlv[20];
+        uint8_t *ip = piv_append_tlv(inner_tlv, TAG_AUTH_RESPONSE, cryptogram, block_len);
+        uint8_t *rp = piv_append_tlv(res_APDU, TAG_DYN_AUTH, inner_tlv, (size_t)(ip - inner_tlv));
+        res_APDU_size = (uint16_t)(rp - res_APDU);
+    }
+    piv_mgm_authenticated = true;
+    sw = SW_OK();
+
+cleanup:
+    mbedtls_platform_zeroize(&st, sizeof(st));
+    mbedtls_platform_zeroize(challenge, sizeof(challenge));
+    mbedtls_platform_zeroize(cryptogram, sizeof(cryptogram));
+    return sw;
+}
+
 static int cmd_piv_authenticate(void) {
     uint8_t alg = P1(apdu);
     uint8_t slot = P2(apdu);
+    if (slot == PIV_SLOT_CARD_MGM) {
+        return cmd_piv_authenticate_management(alg);
+    }
 
     tlv_ctx_t outer, dyn;
     tlv_ctx_init(BYTE_ARRAY(apdu.data, apdu.nc), &outer);
     if (!tlv_find_tag(&outer, TAG_DYN_AUTH, &dyn)) {
-        return SW_WRONG_DATA();
-    }
-
-    if (slot == PIV_SLOT_CARD_MGM) {
-        piv_state_t st;
-        piv_load_state(&st);
-        if (alg != st.mgm_type) {
-            mbedtls_platform_zeroize(&st, sizeof(st));
-            return SW_INCORRECT_P1P2();
-        }
-        uint8_t block_len = (alg == PIV_ALG_3DES) ? 8 : 16;
-
-        bool has_witness = false, has_challenge = false, has_response = false;
-        tlv_ctx_t t_wit = { 0 }, t_chal = { 0 }, t_resp = { 0 };
-        uint8_t *p = NULL;
-        tlv_item_t item;
-        while (tlv_walk(&dyn, &p, &item)) {
-            if (item.tag == TAG_AUTH_WITNESS) {
-                has_witness = true;
-                t_wit.data = (uint8_t *)item.value.data;
-                t_wit.len = (uint16_t)item.value.len;
-            }
-            else if (item.tag == TAG_AUTH_CHALLENGE) {
-                has_challenge = true;
-                t_chal.data = (uint8_t *)item.value.data;
-                t_chal.len = (uint16_t)item.value.len;
-            }
-            else if (item.tag == TAG_AUTH_RESPONSE) {
-                has_response = true;
-                t_resp.data = (uint8_t *)item.value.data;
-                t_resp.len = (uint16_t)item.value.len;
-            }
-        }
-
-        if (has_witness && t_wit.len == 0) {
-            random_fill_buffer(BYTE_ARRAY(piv_mgm_challenge, block_len));
-            piv_mgm_challenge_len = block_len;
-            piv_mgm_challenge_valid = true;
-            piv_mgm_authenticated = false;
-
-            uint8_t enc_wit[16] = { 0 };
-            if (piv_mgm_ecb_crypt(&st, true, piv_mgm_challenge, enc_wit) != 0) {
-                mbedtls_platform_zeroize(&st, sizeof(st));
-                return SW_EXEC_ERROR();
-            }
-            uint8_t inner_tlv[20];
-            uint8_t *ip = piv_append_tlv(inner_tlv, TAG_AUTH_WITNESS, enc_wit, block_len);
-            uint8_t *rp = piv_append_tlv(res_APDU, TAG_DYN_AUTH, inner_tlv, (size_t)(ip - inner_tlv));
-            res_APDU_size = (uint16_t)(rp - res_APDU);
-            mbedtls_platform_zeroize(&st, sizeof(st));
-            return SW_OK();
-        }
-        if (has_challenge && t_chal.len == 0 && !has_witness) {
-            random_fill_buffer(BYTE_ARRAY(piv_mgm_challenge, block_len));
-            uint8_t enc_chal[16] = { 0 };
-            if (piv_mgm_ecb_crypt(&st, true, piv_mgm_challenge, enc_chal) != 0) {
-                mbedtls_platform_zeroize(&st, sizeof(st));
-                return SW_EXEC_ERROR();
-            }
-            memcpy(piv_mgm_challenge, enc_chal, block_len);
-            piv_mgm_challenge_len = block_len;
-            piv_mgm_challenge_valid = true;
-            piv_mgm_authenticated = false;
-
-            uint8_t inner_tlv[20];
-            uint8_t *ip = piv_append_tlv(inner_tlv, TAG_AUTH_CHALLENGE, piv_mgm_challenge, block_len);
-            uint8_t *rp = piv_append_tlv(res_APDU, TAG_DYN_AUTH, inner_tlv, (size_t)(ip - inner_tlv));
-            res_APDU_size = (uint16_t)(rp - res_APDU);
-            mbedtls_platform_zeroize(&st, sizeof(st));
-            return SW_OK();
-        }
-        if (has_witness && t_wit.len == block_len && has_challenge && t_chal.len == block_len) {
-            if (!piv_mgm_challenge_valid || piv_mgm_challenge_len != block_len ||
-                mbedtls_ct_memcmp(t_wit.data, piv_mgm_challenge, block_len) != 0) {
-                piv_mgm_challenge_valid = false;
-                piv_mgm_authenticated = false;
-                mbedtls_platform_zeroize(&st, sizeof(st));
-                return SW_SECURITY_STATUS_NOT_SATISFIED();
-            }
-            if (!piv_check_touch(st.mgm_touch_policy)) {
-                piv_mgm_challenge_valid = false;
-                piv_mgm_authenticated = false;
-                mbedtls_platform_zeroize(&st, sizeof(st));
-                return SW_SECURITY_STATUS_NOT_SATISFIED();
-            }
-            uint8_t host_resp[16] = { 0 };
-            if (piv_mgm_ecb_crypt(&st, true, t_chal.data, host_resp) != 0) {
-                mbedtls_platform_zeroize(&st, sizeof(st));
-                return SW_EXEC_ERROR();
-            }
-            piv_mgm_challenge_valid = false;
-            piv_mgm_authenticated = true;
-
-            uint8_t inner_tlv[20];
-            uint8_t *ip = piv_append_tlv(inner_tlv, TAG_AUTH_RESPONSE, host_resp, block_len);
-            uint8_t *rp = piv_append_tlv(res_APDU, TAG_DYN_AUTH, inner_tlv, (size_t)(ip - inner_tlv));
-            res_APDU_size = (uint16_t)(rp - res_APDU);
-            mbedtls_platform_zeroize(&st, sizeof(st));
-            return SW_OK();
-        }
-        if (has_response && t_resp.len == block_len && piv_mgm_challenge_valid) {
-            uint8_t expected[16] = { 0 };
-            if (piv_mgm_ecb_crypt(&st, true, piv_mgm_challenge, expected) != 0 ||
-                mbedtls_ct_memcmp(t_resp.data, expected, block_len) != 0) {
-                piv_mgm_challenge_valid = false;
-                piv_mgm_authenticated = false;
-                mbedtls_platform_zeroize(&st, sizeof(st));
-                return SW_SECURITY_STATUS_NOT_SATISFIED();
-            }
-            piv_mgm_challenge_valid = false;
-            piv_mgm_authenticated = true;
-            mbedtls_platform_zeroize(&st, sizeof(st));
-            return SW_OK();
-        }
-        mbedtls_platform_zeroize(&st, sizeof(st));
         return SW_WRONG_DATA();
     }
 

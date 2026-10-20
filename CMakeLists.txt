@@ -282,6 +282,12 @@ if(ENABLE_EMULATION)
     SET_VERSION(ver_major ver_minor "${CMAKE_CURRENT_LIST_DIR}/src/fido/version.h")
     enable_testing()
 
+    add_executable(piv_security_test tests/piv_security_test.c src/tlv.c)
+    target_include_directories(piv_security_test PRIVATE ${INCLUDES} ${SYSTEM_INCLUDES})
+    target_compile_options(piv_security_test PRIVATE -Wall -Wextra -Werror)
+    target_link_libraries(piv_security_test PRIVATE mbedtls)
+    add_test(NAME piv_security_test COMMAND piv_security_test)
+
     add_executable(fido_object_provider_test
         ${CMAKE_CURRENT_LIST_DIR}/src/fs/object_crypto_provider.c
         ${CMAKE_CURRENT_LIST_DIR}/src/fido/object_provider.c
