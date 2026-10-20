@@ -14,8 +14,8 @@
 typedef struct { uint8_t id[8]; } picokey_serial_t;
 picokey_serial_t pico_serial;
 #define TIME_H
-static uint32_t now_ms = 1000;
-static uint32_t board_millis(void) { return now_ms; }
+static uint32_t test_clock_ms = 1000;
+static uint32_t board_millis(void) { return test_clock_ms; }
 static void sleep_ms(uint32_t ms) { (void)ms; }
 #include "../src/usb/hid/hid.c"
 #include "../src/usb/ccid/ccid.c"
@@ -304,7 +304,7 @@ static void test_ccid_fifo_waits_for_the_active_worker(void) {
     assert(ccid_rx[ITF_SC_CCID].w_ptr == 0);
     assert_active_preserved();
     worker_busy = false;
-    now_ms++;
+    test_clock_ms++;
     ccid_task();
     assert(vendor_reads == 1 && vendor_available == 0);
     assert(apdus_parsed == 1 && worker_starts == 1 && events_submitted == 1);
@@ -324,13 +324,13 @@ static void test_ccid_fifo_waits_for_the_active_worker(void) {
     assert(ccid_rx[ITF_SC_CCID].w_ptr - ccid_rx[ITF_SC_CCID].r_ptr == 15);
     struct apdu executing = apdu;
     usb_buffer_t buffered = ccid_rx[ITF_SC_CCID];
-    now_ms++;
+    test_clock_ms++;
     ccid_task();
     assert(apdus_parsed == 1 && worker_starts == 1);
     assert(memcmp(&apdu, &executing, sizeof(apdu)) == 0);
     assert(memcmp(&ccid_rx[ITF_SC_CCID], &buffered, sizeof(buffered)) == 0);
     worker_busy = false;
-    now_ms++;
+    test_clock_ms++;
     ccid_task();
     assert(apdus_parsed == 2 && worker_starts == 2 && events_submitted == 2);
     assert(ccid_rx[ITF_SC_CCID].r_ptr == 0 && ccid_rx[ITF_SC_CCID].w_ptr == 0);
