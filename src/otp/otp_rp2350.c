@@ -20,6 +20,7 @@
 #include "picokeys.h"
 #include "otp.h"
 #include "otp_platform.h"
+#include "secure_boot_key.h"
 
 #include "pico/bootrom.h"
 #include "hardware/structs/otp.h"
@@ -148,34 +149,28 @@ static void otp_migrate_chaff(void) {
 }
 
 bool otp_platform_is_secure_boot_enabled(uint8_t *bootkey) {
+    if (!PICO_SECURE_BOOT_KEY_CONFIGURED) {
+        return false;
+    }
     const uint8_t *crit1 = otp_buffer(OTP_DATA_CRIT1_ROW);
     if ((crit1[0] & (1 << OTP_DATA_CRIT1_SECURE_BOOT_ENABLE_LSB)) == 0) {
         return false;
     }
-    alignas(2) uint8_t BOOTKEY[32] = {
-        0xE1, 0xD1, 0x6B, 0xA7, 0x64, 0xAB, 0xD7, 0x12,
-        0xD4, 0xEF, 0x6E, 0x3E, 0xDD, 0x74, 0x4E, 0xD5,
-        0x63, 0x8C, 0x26, 0x0B, 0x77, 0x1C, 0xF9, 0x81,
-        0x51, 0x11, 0x0B, 0xAF, 0xAC, 0x9B, 0xC8, 0x71
-    };
-    uint8_t bootkey_idx = 0;
-    for (; bootkey_idx < 6; bootkey_idx++) {
+    const uint8_t *boot_flags1 = otp_buffer_raw(OTP_DATA_BOOT_FLAGS1_ROW);
+    for (uint8_t bootkey_idx = 0; bootkey_idx < 4; bootkey_idx++) {
+        if ((boot_flags1[0] & (1u << (bootkey_idx + OTP_DATA_BOOT_FLAGS1_KEY_VALID_LSB))) == 0 ||
+            (boot_flags1[1] & (1u << bootkey_idx)) != 0) {
+            continue;
+        }
         const uint8_t *bootkey_row = otp_buffer(OTP_DATA_BOOTKEY0_0_ROW + 0x10 * bootkey_idx);
-        if (memcmp(bootkey_row, BOOTKEY, sizeof(BOOTKEY)) == 0) {
-            break;
+        if (memcmp(bootkey_row, pico_secure_boot_key_hash, sizeof(pico_secure_boot_key_hash)) == 0) {
+            if (bootkey) {
+                *bootkey = bootkey_idx;
+            }
+            return true;
         }
     }
-    if (bootkey_idx == 6) {
-        return false;
-    }
-    const uint8_t *boot_flags1 = otp_buffer(OTP_DATA_BOOT_FLAGS1_ROW);
-    if ((boot_flags1[0] & (1 << (bootkey_idx + OTP_DATA_BOOT_FLAGS1_KEY_VALID_LSB))) == 0) {
-        return false;
-    }
-    if (bootkey) {
-        *bootkey = bootkey_idx;
-    }
-    return true;
+    return false;
 }
 
 bool otp_platform_is_secure_boot_locked(void) {
@@ -200,16 +195,24 @@ bool otp_platform_is_secure_boot_locked(void) {
 int otp_platform_enable_secure_boot(uint8_t bootkey, bool secure_lock) {
     int ret = 0;
 
-    if (bootkey >= 6) {
+    if (!PICO_SECURE_BOOT_KEY_CONFIGURED || bootkey >= 4) {
         return PICOKEYS_WRONG_DATA;
     }
 
-    alignas(2) uint8_t BOOTKEY[] = "\xe1\xd1\x6b\xa7\x64\xab\xd7\x12\xd4\xef\x6e\x3e\xdd\x74\x4e\xd5\x63\x8c\x26\xb\x77\x1c\xf9\x81\x51\x11\xb\xaf\xac\x9b\xc8\x71";
-    if (is_empty_otp_buffer(OTP_DATA_BOOTKEY0_0_ROW + 0x10*bootkey, 32)) {
-        PICOKEYS_CHECK(otp_write_data(OTP_DATA_BOOTKEY0_0_ROW + 0x10*bootkey, CONST_BYTE_ARRAY(BOOTKEY, sizeof(BOOTKEY))));
+    uint16_t key_row = OTP_DATA_BOOTKEY0_0_ROW + 0x10 * bootkey;
+    const uint8_t *boot_flags1 = otp_buffer_raw(OTP_DATA_BOOT_FLAGS1_ROW);
+    if (boot_flags1[1] & (1u << bootkey)) {
+        return PICOKEYS_WRONG_DATA;
     }
 
-    const uint8_t *boot_flags1 = otp_buffer_raw(OTP_DATA_BOOT_FLAGS1_ROW);
+    alignas(2) uint8_t BOOTKEY[sizeof(pico_secure_boot_key_hash)];
+    memcpy(BOOTKEY, pico_secure_boot_key_hash, sizeof(BOOTKEY));
+    if (is_empty_otp_buffer(key_row, sizeof(BOOTKEY))) {
+        PICOKEYS_CHECK(otp_write_data(key_row, CONST_BYTE_ARRAY(BOOTKEY, sizeof(BOOTKEY))));
+    }
+    if (memcmp(otp_buffer(key_row), BOOTKEY, sizeof(BOOTKEY)) != 0) {
+        return PICOKEYS_WRONG_DATA;
+    }
     alignas(4) uint8_t flagsb1[] = { boot_flags1[0] | (1 << (bootkey + OTP_DATA_BOOT_FLAGS1_KEY_VALID_LSB)), boot_flags1[1], boot_flags1[2], 0x00 };
     if (secure_lock) {
         flagsb1[1] |= ((OTP_DATA_BOOT_FLAGS1_KEY_INVALID_BITS >> OTP_DATA_BOOT_FLAGS1_KEY_INVALID_LSB) & (~(1 << bootkey)));

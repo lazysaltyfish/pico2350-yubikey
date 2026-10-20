@@ -291,6 +291,7 @@ if(ENABLE_EMULATION)
     enable_testing()
     find_package(Python3 REQUIRED COMPONENTS Interpreter)
     add_test(NAME verification_runner_test COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_LIST_DIR}/tests/verification_runner_test.py")
+    add_test(NAME secure_boot_key_test COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_LIST_DIR}/tests/secure_boot_key_test.py")
 
     add_executable(hsmauth_security_test tests/hsmauth_security_test.c src/fido/applet_storage.c src/fido/applet_txn.c)
     target_include_directories(hsmauth_security_test PRIVATE ${INCLUDES} ${SYSTEM_INCLUDES})
@@ -473,10 +474,30 @@ else()
 
     pico_set_uf2_family(${CMAKE_PROJECT_NAME} "rp2350-arm-s")
     pico_embed_pt_in_binary(${CMAKE_PROJECT_NAME} "${CMAKE_CURRENT_LIST_DIR}/config/rp2350/pt.json")
+    set(SECURE_BOOT_GENERATED_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
+    file(MAKE_DIRECTORY "${SECURE_BOOT_GENERATED_DIR}")
+    target_include_directories(${CMAKE_PROJECT_NAME} BEFORE PRIVATE "${SECURE_BOOT_GENERATED_DIR}")
     if(SECURE_BOOT_PKEY)
-        message(STATUS "Secure Boot Key ${SECURE_BOOT_PKEY}")
-        pico_sign_binary(${CMAKE_PROJECT_NAME} ${SECURE_BOOT_PKEY})
+        get_filename_component(SECURE_BOOT_SIGNING_KEY "${SECURE_BOOT_PKEY}" ABSOLUTE BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
+        find_package(Python3 REQUIRED COMPONENTS Interpreter)
+        set(SECURE_BOOT_KEY_GENERATOR "${CMAKE_CURRENT_LIST_DIR}/tools/secure_boot_key.py")
+        set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${SECURE_BOOT_SIGNING_KEY}" "${SECURE_BOOT_KEY_GENERATOR}")
+        execute_process(
+            COMMAND "${Python3_EXECUTABLE}" "${SECURE_BOOT_KEY_GENERATOR}"
+                --key "${SECURE_BOOT_SIGNING_KEY}"
+                --header "${SECURE_BOOT_GENERATED_DIR}/secure_boot_key.h"
+                --json "${CMAKE_CURRENT_BINARY_DIR}/secure_boot.json"
+            RESULT_VARIABLE SECURE_BOOT_METADATA_RESULT
+            ERROR_VARIABLE SECURE_BOOT_METADATA_ERROR
+        )
+        if(NOT SECURE_BOOT_METADATA_RESULT EQUAL 0)
+            message(FATAL_ERROR "Cannot derive configured secure boot key: ${SECURE_BOOT_METADATA_ERROR}")
+        endif()
+        pico_sign_binary(${CMAKE_PROJECT_NAME} "${SECURE_BOOT_SIGNING_KEY}")
         pico_hash_binary(${CMAKE_PROJECT_NAME})
+    else()
+        configure_file("${CMAKE_CURRENT_LIST_DIR}/config/rp2350/secure_boot_key.h" "${SECURE_BOOT_GENERATED_DIR}/secure_boot_key.h" COPYONLY)
+        file(REMOVE "${CMAKE_CURRENT_BINARY_DIR}/secure_boot.json")
     endif()
 
     list(APPEND INCLUDES
