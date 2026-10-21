@@ -82,8 +82,8 @@ static bool is_empty_otp_buffer(uint16_t row, uint16_t len) {
 }
 
 static bool is_otp_locked_page(uint8_t page) {
-	volatile uint32_t *p = ((uint32_t *)(OTP_DATA_BASE + ((OTP_DATA_PAGE0_LOCK0_ROW + page*2)*2)));
-    return ((p[0] & 0xFFFF0000) == 0x3C3C0000 && (p[1] & 0xFF) == 0x3C);
+    const uint8_t *lock1 = otp_buffer_raw(OTP_DATA_PAGE0_LOCK0_ROW + page * 2 + 1);
+    return (lock1[0] == 0x3C && lock1[1] == 0x3C && lock1[2] == 0x3C);
 }
 
 static void otp_lock_page(uint8_t page) {
@@ -145,7 +145,6 @@ static int otp_migrate_key(uint16_t new_row, uint16_t old_row, uint16_t len) {
 static void otp_migrate_chaff(void) {
     otp_migrate_key(OTP_MKEK_ROW, OTP_OLD_MKEK_ROW, 32);
     otp_migrate_key(OTP_DEVK_ROW, OTP_OLD_DEVK_ROW, 32);
-    otp_lock_page(OTP_MKEK_ROW >> 6);
 }
 
 bool otp_platform_is_secure_boot_enabled(uint8_t *bootkey) {
