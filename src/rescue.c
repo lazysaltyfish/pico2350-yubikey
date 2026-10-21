@@ -81,7 +81,9 @@ const uint8_t atr_rescue[] = {
 
 extern const uint8_t *ccid_atr;
 WEAK int set_atr(void) {
-    ccid_atr = atr_rescue;
+    if (!ccid_atr) {
+        ccid_atr = atr_rescue;
+    }
     return 0;
 }
 

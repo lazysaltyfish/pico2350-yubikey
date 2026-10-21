@@ -270,7 +270,9 @@ int driver_process_usb_packet_ccid(uint8_t itf, uint16_t rx_read) {
                 ccid_resp_fast[itf]->abRFU0 = 0;
                 ccid_resp_fast[itf]->abRFU1 = 0;
                 //printf("1 %x %x %x || %x %x %x\n",ccid_resp_fast->apdu,apdu.rdata,ccid_resp_fast,ccid_header,ccid_header->apdu,apdu.data);
-                memcpy(&ccid_resp_fast[itf]->apdu, ccid_atr + 1, size_atr);
+                if (size_atr > 0) {
+                    memcpy(&ccid_resp_fast[itf]->apdu, ccid_atr + 1, size_atr);
+                }
                 if (ccid_status == 1) {
                     //card_start(apdu_thread);
                 }

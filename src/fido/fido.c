@@ -32,6 +32,8 @@
 #include "mbedtls/sha256.h"
 #if defined(USB_ITF_CCID)
 #include "ccid/ccid.h"
+#else
+extern const uint8_t *ccid_atr;
 #endif
 #if defined(PICO_PLATFORM)
 #include "bsp/board.h"
@@ -77,6 +79,11 @@ const uint8_t atr_fido[] = {
     0x75, 0x62, 0x69, 0x4b, 0x65, 0x79, 0x40
 };
 
+int set_atr(void) {
+    ccid_atr = atr_fido;
+    return 0;
+}
+
 uint8_t certdev_sha256[32] = { 0 };
 
 static uint8_t fido_get_version_major(void) {
@@ -107,7 +114,7 @@ extern char const *string_desc_arr[];
 
 INITIALIZER ( fido_ctor ) {
 #if defined(USB_ITF_CCID) || defined(ENABLE_EMULATION)
-    ccid_atr = atr_fido;
+    set_atr();
 #endif
 #ifndef ENABLE_EMULATION
     string_desc_arr[1] = "lazysaltyfish";

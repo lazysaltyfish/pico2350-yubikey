@@ -77,6 +77,8 @@ int card_status(uint8_t itf) { (void)itf; return PICOKEYS_ERR_FILE_NOT_FOUND; }
 static uint8_t vendor_fifo[256];
 static uint32_t vendor_available;
 static unsigned vendor_reads;
+static uint8_t vendor_tx[256];
+static uint32_t vendor_tx_len;
 uint32_t tud_vendor_n_available(uint8_t itf) { assert(itf == ITF_SC_CCID); return vendor_available; }
 uint32_t tud_vendor_n_read(uint8_t itf, void *out, uint32_t size) {
     assert(itf == ITF_SC_CCID && size <= vendor_available);
@@ -87,7 +89,10 @@ uint32_t tud_vendor_n_read(uint8_t itf, void *out, uint32_t size) {
     return size;
 }
 uint32_t tud_vendor_n_write(uint8_t itf, const void *data, uint32_t size) {
-    (void)itf; (void)data; return size;
+    assert(itf == ITF_SC_CCID && size <= sizeof(vendor_tx));
+    memcpy(vendor_tx, data, size);
+    vendor_tx_len = size;
+    return size;
 }
 uint32_t tud_vendor_n_write_flush(uint8_t itf) { (void)itf; return 0; }
 void vendord_init(void) {}
@@ -336,6 +341,32 @@ static void test_ccid_fifo_waits_for_the_active_worker(void) {
     assert(ccid_rx[ITF_SC_CCID].r_ptr == 0 && ccid_rx[ITF_SC_CCID].w_ptr == 0);
 }
 
+static void test_ccid_power_on_returns_configured_atr(void) {
+    static const uint8_t yubikey5_atr[] = {
+        23,
+        0x3b, 0xfd, 0x13, 0x00, 0x00, 0x81, 0x31, 0xfe, 0x15, 0x80, 0x73, 0xc0, 0x21, 0xc0, 0x57, 0x59,
+        0x75, 0x62, 0x69, 0x4b, 0x65, 0x79, 0x40
+    };
+    reset_active(ITF_HID);
+    ccid_init();
+    memset(ccid_rx, 0, ITF_SC_TOTAL * sizeof(*ccid_rx));
+    memset(ccid_tx, 0, ITF_SC_TOTAL * sizeof(*ccid_tx));
+    vendor_available = vendor_reads = vendor_tx_len = 0;
+    worker_busy = false;
+    ccid_atr = yubikey5_atr;
+
+    uint8_t power_on[10] = { CCID_POWER_ON, 0, 0, 0, 0, 0, 0x2A, 0, 0, 0 };
+    memcpy(vendor_fifo, power_on, sizeof(power_on));
+    vendor_available = sizeof(power_on);
+    tud_vendor_rx_cb(ITF_SC_CCID, NULL, 0);
+
+    assert(vendor_tx_len == 10 + yubikey5_atr[0]);
+    assert(vendor_tx[0] == CCID_DATA_BLOCK_RET);
+    assert(vendor_tx[1] == yubikey5_atr[0] && vendor_tx[2] == 0 && vendor_tx[3] == 0 && vendor_tx[4] == 0);
+    assert(vendor_tx[6] == 0x2A);
+    assert(memcmp(vendor_tx + 10, yubikey5_atr + 1, yubikey5_atr[0]) == 0);
+}
+
 int main(void) {
     test_busy_reply_completion_preserves_active_buffers();
     test_busy_submission_failure_does_not_consume_an_active_report();
@@ -343,6 +374,7 @@ int main(void) {
     test_incomplete_packet_timeout_waits_for_worker();
     test_get_report_propagates_actual_length();
     test_ccid_fifo_waits_for_the_active_worker();
+    test_ccid_power_on_returns_configured_atr();
     puts("USB HID/CCID arbitration regression tests passed");
     return 0;
 }
