@@ -41,6 +41,7 @@ extern int verify_key(const uint8_t *appId, const uint8_t *keyHandle, mbedtls_ec
 extern int wait_button_pressed(void);
 extern int wait_button_pressed_timeout(uint32_t timeout_seconds);
 extern void init_fido(void);
+extern void fido_ensure_ready(void);
 extern void init_otp(void);
 extern void scan_all(void);
 extern mbedtls_ecp_group_id fido_curve_to_mbedtls(int curve);

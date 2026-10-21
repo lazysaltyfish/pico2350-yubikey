@@ -4,6 +4,9 @@
  * SPDX-License-Identifier: AGPL-3.0-only
  */
 #include "picokeys.h"
+#if defined(PICO_PLATFORM)
+#include "pico/stdlib.h"
+#endif
 #include "applet_storage.h"
 #include "applet_txn.h"
 #include "mbedtls/platform_util.h"
@@ -32,6 +35,11 @@ bool applet_txn_ready(applet_txn_t *txn) {
 }
 
 static bool save_marker(applet_txn_t *txn, bool dirty) {
+#if defined(PICO_PLATFORM)
+    if (get_core_num() != 1) {
+        return false;
+    }
+#endif
     uint8_t record[sizeof(clean_record)];
     memcpy(record, clean_record, sizeof(record));
     record[4] = dirty ? 1 : 0;

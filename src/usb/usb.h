@@ -97,6 +97,7 @@ extern uint8_t card_active_interface(void);
 extern void usb_desc_setup(void);
 
 #ifdef USB_ITF_HID
+extern void hid_select_current_app(void);
 extern void driver_exec_finished_hid(uint16_t size_next);
 extern void driver_exec_finished_cont_hid(uint8_t itf, uint16_t size_next, uint16_t offset);
 #endif

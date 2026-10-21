@@ -143,6 +143,11 @@ int credential_rp_id_decrypt(const file_t *ef, uint8_t **rp_id, size_t *rp_id_le
 }
 
 int credential_migrate_rp_secure(void) {
+#if defined(PICO_PLATFORM)
+    if (get_core_num() != 1) {
+        return PICOKEYS_OK;
+    }
+#endif
     bool changed = false;
     for (uint16_t i = 0; i < MAX_RESIDENT_CREDENTIALS; i++) {
         file_t *ef = file_search((uint16_t)(EF_RP + i));

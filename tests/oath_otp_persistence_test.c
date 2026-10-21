@@ -166,13 +166,24 @@ static void test_otp_core_isolation_and_button_persistence(void) {
     assert(!scanned && fixture_writes == 0 && fixture_syncs == 0);
     assert(otp_select(&app, 1) == PICOKEYS_OK);
     assert(fixture_writes == 0 && fixture_syncs == 0);
+    assert(oath_select(&app, 1) == PICOKEYS_OK);
+    assert(!oath_migration_done && !oath_txn.faulted && fixture_writes == 0 && fixture_syncs == 0);
+    assert(!applet_txn_begin(&oath_txn));
+    assert(!oath_txn.faulted && fixture_writes == 0 && fixture_syncs == 0);
     otp_hid_refresh_status();
     uint8_t snap[8] = { 0 };
     otp_hid_copy_status(snap);
     assert(snap[7] == 0x20);
 
-    /* Core 1 initializes and persists slots. */
+    /* Core 1 initializes and persists slots, and completes deferred OATH migration. */
     fixture_core = 1;
+    assert(oath_cmd(INS_LIST, 0, 0, NULL, 0) == 0x9000);
+    assert(oath_migration_done && !oath_txn.faulted);
+    otp_pin_verified = true;
+    apdu.rlen = 0;
+    apdu.ne = 256;
+    assert(oath_select(&app, 0) == PICOKEYS_OK);
+    assert(otp_pin_verified && apdu.rlen == 0 && apdu.ne == 256);
     assert(otp_select(&app, 1) == PICOKEYS_OK);
     assert(scanned);
 

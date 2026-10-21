@@ -167,23 +167,41 @@ static bool oath_code_present(void) {
 }
 
 static int oath_select(app_t *a, uint8_t force) {
-    (void) force;
     if (cap_supported(CAP_OATH)) {
         a->process_apdu = oath_process_apdu;
         a->unload = oath_unload;
-        oath_chain_state.type = OATH_CHAIN_NONE;
-        otp_pin_verified = false;
         if (!oath_storage_ready()) {
+            oath_chain_state.type = OATH_CHAIN_NONE;
+            otp_pin_verified = false;
             validated = false;
             return PICOKEYS_ERR_MEMORY_FATAL;
         }
-        bool code_present = oath_code_present();
-        validated = !code_present && !file_has_data(file_search_by_fid(EF_OTP_PIN, NULL, SPECIFY_EF));
+#if defined(PICO_PLATFORM)
+        if (get_core_num() != 1) {
+            /* A USB-side SELECT must not migrate or commit Flash on core 0. */
+            if (force) {
+                oath_chain_state.type = OATH_CHAIN_NONE;
+                otp_pin_verified = false;
+                bool code_present = oath_code_present();
+                validated = !code_present && !file_has_data(file_search_by_fid(EF_OTP_PIN, NULL, SPECIFY_EF));
+            }
+            return PICOKEYS_OK;
+        }
+#endif
         int migration_ret = oath_migrate_secrets();
         if (migration_ret != PICOKEYS_OK) {
+            oath_chain_state.type = OATH_CHAIN_NONE;
+            otp_pin_verified = false;
             validated = false;
             return migration_ret;
         }
+        if (!force) {
+            return PICOKEYS_OK;
+        }
+        oath_chain_state.type = OATH_CHAIN_NONE;
+        otp_pin_verified = false;
+        bool code_present = oath_code_present();
+        validated = !code_present && !file_has_data(file_search_by_fid(EF_OTP_PIN, NULL, SPECIFY_EF));
         res_APDU_size = 0;
         res_APDU[res_APDU_size++] = TAG_T_VERSION;
         res_APDU[res_APDU_size++] = 3;
@@ -445,6 +463,13 @@ static int oath_migrate_secrets(void) {
     if (oath_migration_done) {
         return PICOKEYS_OK;
     }
+#if defined(PICO_PLATFORM)
+    /* HID INIT/USB callbacks run on core 0. Only the card worker can wait for
+     * Flash persistence without deadlocking the USB/Flash service loop. */
+    if (get_core_num() != 1) {
+        return PICOKEYS_OK;
+    }
+#endif
 
     if (!applet_txn_begin(&oath_txn)) return PICOKEYS_ERR_MEMORY_FATAL;
     oath_migration_ctx_t migration = { .ret = PICOKEYS_OK, .changed = false };
@@ -849,6 +874,7 @@ static int cmd_reset(void) {
         return SW_MEMORY_FAILURE();
     }
     if (oath_storage_finish(PICOKEYS_OK, true) != PICOKEYS_OK) return SW_MEMORY_FAILURE();
+    oath_migration_done = true;
     validated = true;
     otp_pin_verified = false;
     return SW_OK();
@@ -1687,6 +1713,11 @@ static int oath_process_apdu(void) {
         force_button_wait = prior_force;
         if (!touched) return SW_SECURITY_STATUS_NOT_SATISFIED();
         if (!applet_txn_recover_begin(&oath_txn)) return SW_MEMORY_FAILURE();
+    }
+    else if (!oath_migration_done && oath_migrate_secrets() != PICOKEYS_OK) {
+        validated = otp_pin_verified = false;
+        oath_chain_state.type = OATH_CHAIN_NONE;
+        return SW_MEMORY_FAILURE();
     }
     if (CLA(apdu) != 0x00) {
         oath_chain_state.type = OATH_CHAIN_NONE;

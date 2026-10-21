@@ -300,6 +300,8 @@ uint16_t set_res_sw(uint8_t sw1, uint8_t sw2) {
     return make_uint16_be(sw1, sw2);
 }
 
+WEAK void hid_select_current_app(void) {}
+
 void *apdu_thread(void *arg) {
     (void)arg;
     card_init_core1();
@@ -307,16 +309,23 @@ void *apdu_thread(void *arg) {
         uint32_t m = 0;
         queue_remove_blocking(&usb_to_card_q, &m);
         uint32_t flag = m + 1;
-        if (m != EV_CMD_AVAILABLE) {
-            queue_add_blocking(&card_to_usb_q, &flag);
-        }
 
         if (m == EV_VERIFY_CMD_AVAILABLE || m == EV_MODIFY_CMD_AVAILABLE) {
+            queue_add_blocking(&card_to_usb_q, &flag);
             set_res_sw(0x6f, 0x00);
             goto done;
         }
         else if (m == EV_EXIT) {
+            if (current_app && current_app->unload) {
+                current_app->unload();
+                current_app = NULL;
+            }
+            apdu_clear_response_buffer();
+            queue_add_blocking(&card_to_usb_q, &flag);
             break;
+        }
+        else if (m != EV_CMD_AVAILABLE) {
+            queue_add_blocking(&card_to_usb_q, &flag);
         }
 
 #ifdef ENABLE_OTP_APP
@@ -329,6 +338,7 @@ void *apdu_thread(void *arg) {
             continue;
         }
 #endif
+        hid_select_current_app();
         process_apdu();
 
 done:   ;
@@ -338,12 +348,6 @@ done:   ;
         flag = EV_EXEC_FINISHED;
         queue_add_blocking(&card_to_usb_q, &flag);
     }
-    //printf("EXIT !!!!!!\n");
-    if (current_app && current_app->unload) {
-        current_app->unload();
-        current_app = NULL;
-    }
-    apdu_clear_response_buffer();
     return NULL;
 }
 

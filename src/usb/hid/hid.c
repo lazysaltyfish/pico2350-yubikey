@@ -350,6 +350,35 @@ int driver_process_usb_nopacket_hid(void) {
 }
 
 extern const uint8_t fido_aid[], u2f_aid[], oath_aid[];
+
+void hid_select_current_app(void) {
+    if (card_active_interface() != ITF_HID) {
+        return;
+    }
+    if (thread_type == 2) {
+        select_app(CONST_BYTE_ARRAY(fido_aid + 1, fido_aid[0]));
+        return;
+    }
+    if (thread_type != 1) {
+        return;
+    }
+    bool is_select = apdu.header != NULL && INS(apdu) == 0xA4 && P1(apdu) == 0x04 &&
+                     (P2(apdu) == 0x00 || P2(apdu) == 0x04);
+    if (is_select) {
+        return;
+    }
+    uint32_t saved_ne = apdu.ne;
+    if (is_nk) {
+#ifdef ENABLE_OATH_APP
+        select_app(CONST_BYTE_ARRAY(oath_aid + 1, oath_aid[0]));
+#endif
+    }
+    else {
+        select_app(CONST_BYTE_ARRAY(u2f_aid + 1, u2f_aid[0]));
+    }
+    res_APDU_size = 0;
+    apdu.ne = saved_ne;
+}
 extern void *cbor_thread(void *);
 
 uint16_t *get_send_buffer_size(uint8_t itf) {
@@ -550,12 +579,6 @@ int driver_process_usb_packet_hid(uint16_t read) {
                   (msg_packet.len == msg_packet.current_len && msg_packet.len > 0))) {
             if (last_cmd == CTAPHID_OTP) {
                 is_nk = true;
-#ifdef ENABLE_OATH_APP
-                select_app(CONST_BYTE_ARRAY(oath_aid + 1, oath_aid[0]));
-#endif
-            }
-            else {
-                select_app(CONST_BYTE_ARRAY(u2f_aid + 1, u2f_aid[0]));
             }
 
             thread_type = 1;
@@ -574,7 +597,6 @@ int driver_process_usb_packet_hid(uint16_t read) {
                  (msg_packet.len == 0 || (msg_packet.len == msg_packet.current_len && msg_packet.len > 0))) {
             thread_type = 2;
             cancel_button = false;
-            select_app(CONST_BYTE_ARRAY(fido_aid + 1, fido_aid[0]));
             if (msg_packet.current_len == msg_packet.len && msg_packet.len > 0) {
                 apdu_sent = cbor_process(last_cmd, msg_packet.data, msg_packet.len);
             }

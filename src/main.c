@@ -66,25 +66,36 @@ int register_app(int (*select_aid)(app_t *, uint8_t), const uint8_t *aid) {
 }
 
 int select_app(const_byte_array_t aid) {
-    if (current_app && current_app->aid && (current_app->aid + 1 == aid.data || (aid.len >= current_app->aid[0] && !memcmp(current_app->aid + 1, aid.data, current_app->aid[0])))) {
-        current_app->select_aid(current_app, 0);
-        return PICOKEYS_OK;
+    if (current_app && current_app->aid && current_app->aid + 1 == aid.data) {
+        int ret = current_app->select_aid(current_app, 0);
+        if (ret == PICOKEYS_ERR_FILE_NOT_FOUND) {
+            current_app = NULL;
+        }
+        return ret;
     }
     for (int a = 0; a < num_apps; a++) {
         if (aid.len >= apps[a].aid[0] && !memcmp(apps[a].aid + 1, aid.data, apps[a].aid[0])) {
             if (current_app) {
                 if (current_app->aid && aid.len >= current_app->aid[0] && !memcmp(current_app->aid + 1, aid.data, current_app->aid[0])) {
-                    current_app->select_aid(current_app, 1);
-                    return PICOKEYS_OK;
+                    int ret = current_app->select_aid(current_app, 1);
+                    if (ret == PICOKEYS_ERR_FILE_NOT_FOUND) {
+                        current_app = NULL;
+                    }
+                    return ret;
                 }
                 if (current_app->unload) {
                     current_app->unload();
                 }
             }
             current_app = &apps[a];
-            if (current_app->select_aid(current_app, 1) == PICOKEYS_OK) {
+            int ret = current_app->select_aid(current_app, 1);
+            if (ret == PICOKEYS_OK) {
                 return PICOKEYS_OK;
             }
+            if (ret == PICOKEYS_ERR_FILE_NOT_FOUND) {
+                current_app = NULL;
+            }
+            return ret;
         }
     }
     return PICOKEYS_ERR_FILE_NOT_FOUND;

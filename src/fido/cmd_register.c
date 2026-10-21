@@ -127,6 +127,7 @@ static const cmd_t cmds[] = {
 };
 
 int u2f_process_apdu(void) {
+    fido_ensure_ready();
     if (CLA(apdu) != 0x00) {
         return SW_CLA_NOT_SUPPORTED();
     }

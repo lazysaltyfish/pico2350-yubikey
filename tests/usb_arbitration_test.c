@@ -58,7 +58,12 @@ void usb_set_timeout_counter(uint8_t itf, uint32_t value) { (void)itf; (void)val
 void timeout_stop(void) { worker_busy = false; }
 void init_fido(void) {}
 bool is_req_button_pending(void) { return false; }
-int select_app(const_byte_array_t aid) { (void)aid; apps_selected++; return PICOKEYS_OK; }
+static const uint8_t *last_selected_aid;
+int select_app(const_byte_array_t aid) {
+    last_selected_aid = aid.data;
+    apps_selected++;
+    return PICOKEYS_OK;
+}
 uint16_t apdu_process(uint8_t itf, const_byte_array_t request) {
     (void)itf; (void)request; apdus_parsed++; return 1;
 }
@@ -367,6 +372,50 @@ static void test_ccid_power_on_returns_configured_atr(void) {
     assert(memcmp(vendor_tx + 10, yubikey5_atr + 1, yubikey5_atr[0]) == 0);
 }
 
+static void test_hid_defers_applet_selection_to_core1_worker(void) {
+    uint8_t list_apdu[4] = { 0x00, 0xA1, 0x00, 0x00 };
+    uint8_t select_apdu[5] = { 0x00, 0xA4, 0x04, 0x00, 0x00 };
+
+    /* CTAPHID_OTP on Core 0 must not call select_app() before Core 1 starts. */
+    reset_active(ITF_HID);
+    hid_rx[ITF_HID_CTAP].r_ptr = hid_rx[ITF_HID_CTAP].w_ptr = 0;
+    msg_packet.len = msg_packet.current_len = 0;
+    worker_busy = false;
+    last_selected_aid = NULL;
+    CTAPHID_FRAME otp_req = incoming(0x11223344, CTAPHID_OTP, sizeof(list_apdu));
+    memcpy(otp_req.init.data, list_apdu, sizeof(list_apdu));
+    receive(&otp_req);
+    assert(apdus_parsed == 1 && worker_starts == 1 && events_submitted == 1);
+    assert(apps_selected == 0 && is_nk);
+    apdu.header = list_apdu;
+    apdu.rlen = 19;
+    apdu.ne = 256;
+    hid_select_current_app();
+    assert(apps_selected == 1 && last_selected_aid == oath_aid + 1);
+    assert(apdu.rlen == 0 && apdu.ne == 256);
+
+    /* Explicit ISO 7816 SELECT APDUs let process_apdu() perform the selection once. */
+    apps_selected = 0;
+    last_selected_aid = NULL;
+    apdu.header = select_apdu;
+    hid_select_current_app();
+    assert(apps_selected == 0 && last_selected_aid == NULL);
+
+    /* CTAPHID_CBOR on Core 0 defers fido_aid selection to cbor_thread on Core 1. */
+    reset_active(ITF_HID);
+    hid_rx[ITF_HID_CTAP].r_ptr = hid_rx[ITF_HID_CTAP].w_ptr = 0;
+    msg_packet.len = msg_packet.current_len = 0;
+    worker_busy = false;
+    last_selected_aid = NULL;
+    CTAPHID_FRAME cbor_req = incoming(0x11223344, CTAPHID_CBOR, 1);
+    cbor_req.init.data[0] = 0x04;
+    receive(&cbor_req);
+    assert(apdus_parsed == 1 && worker_starts == 1 && events_submitted == 1);
+    assert(apps_selected == 0);
+    hid_select_current_app();
+    assert(apps_selected == 1 && last_selected_aid == fido_aid + 1);
+}
+
 int main(void) {
     test_busy_reply_completion_preserves_active_buffers();
     test_busy_submission_failure_does_not_consume_an_active_report();
@@ -375,6 +424,7 @@ int main(void) {
     test_get_report_propagates_actual_length();
     test_ccid_fifo_waits_for_the_active_worker();
     test_ccid_power_on_returns_configured_atr();
+    test_hid_defers_applet_selection_to_core1_worker();
     puts("USB HID/CCID arbitration regression tests passed");
     return 0;
 }

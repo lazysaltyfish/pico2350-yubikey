@@ -40,6 +40,7 @@ static volatile size_t cbor_len = 0;
 static volatile uint8_t cbor_cmd = 0;
 
 int cbor_parse(uint8_t cmd, const uint8_t *data, size_t len) {
+    fido_ensure_ready();
     pin_uv_auth_token_tick();
     cbor_cred_mgmt_tick();
     cbor_large_blobs_tick();
@@ -122,11 +123,17 @@ void *cbor_thread(void *arg) {
         uint32_t m;
         queue_remove_blocking(&usb_to_card_q, &m);
         uint32_t flag = m + 1;
-        queue_add_blocking(&card_to_usb_q, &flag);
 
         if (m == EV_EXIT) {
+            if (current_app && current_app->unload) {
+                current_app->unload();
+                current_app = NULL;
+            }
+            queue_add_blocking(&card_to_usb_q, &flag);
             break;
         }
+        queue_add_blocking(&card_to_usb_q, &flag);
+        hid_select_current_app();
         const uint8_t *data = (const uint8_t *)cbor_data;
         size_t len = cbor_len;
         uint8_t cmd = cbor_cmd;

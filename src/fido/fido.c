@@ -509,7 +509,14 @@ int encrypt_keydev_f1(const uint8_t keydev[32]) {
     return ret;
 }
 
+static bool fido_scanned = false;
+
 int scan_files_fido(void) {
+#if defined(PICO_PLATFORM)
+    if (get_core_num() != 1) {
+        return PICOKEYS_OK;
+    }
+#endif
     ef_keydev = file_search_by_fid(EF_KEY_DEV, NULL, SPECIFY_EF);
     ef_keydev_enc = file_search_by_fid(EF_KEY_DEV_ENC, NULL, SPECIFY_EF);
     ef_vault_key = file_search_by_fid(EF_VAULT_KEY, NULL, SPECIFY_EF);
@@ -630,20 +637,39 @@ int scan_files_fido(void) {
 }
 
 void scan_all(void) {
+#if defined(PICO_PLATFORM)
+    if (get_core_num() != 1) {
+        return;
+    }
+#endif
     //file_scan_flash();
-    scan_files_fido();
+    if (scan_files_fido() == PICOKEYS_OK) {
+        fido_scanned = true;
+    }
+}
+
+void fido_ensure_ready(void) {
+#if defined(PICO_PLATFORM)
+    if (get_core_num() != 1) {
+        return;
+    }
+#endif
+    if (!fido_scanned) {
+        scan_all();
+        credential_migrate_rp_secure();
+    }
+#ifdef ENABLE_OTP_APP
+    init_otp();
+#endif
 }
 
 extern bool needs_power_cycle;
 void init_fido(void) {
     fido_object_authorization_session_invalidate();
     keydev_unlocked = false;
-    scan_all();
-    credential_migrate_rp_secure();
-#ifdef ENABLE_OTP_APP
-    init_otp();
-#endif
     needs_power_cycle = false;
+    fido_scanned = false;
+    fido_ensure_ready();
 }
 
 int wait_button_pressed(void) {
@@ -810,6 +836,7 @@ static const cmd_t cmds[] = {
 };
 
 int fido_process_apdu(void) {
+    fido_ensure_ready();
     if (CLA(apdu) != 0x00 && CLA(apdu) != 0x80) {
         return SW_CLA_NOT_SUPPORTED();
     }
