@@ -472,6 +472,12 @@ else()
 
     SET_VERSION(ver_major ver_minor "${CMAKE_CURRENT_LIST_DIR}/src/fido/version.h")
 
+    add_compile_definitions(
+        PICO_STACK_SIZE=0x2000
+        PICO_CORE1_STACK_SIZE=0x4000
+    )
+    pico_set_linker_script(${CMAKE_PROJECT_NAME} "${CMAKE_CURRENT_LIST_DIR}/config/rp2350/memmap_rp2350.ld")
+
     pico_set_uf2_family(${CMAKE_PROJECT_NAME} "rp2350-arm-s")
     pico_embed_pt_in_binary(${CMAKE_PROJECT_NAME} "${CMAKE_CURRENT_LIST_DIR}/config/rp2350/pt.json")
     set(SECURE_BOOT_GENERATED_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
