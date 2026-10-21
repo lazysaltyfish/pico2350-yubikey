@@ -53,10 +53,10 @@ extern int picokey_init(void);
 extern void low_flash_init_core1(void);
 
 static inline uint16_t make_uint16_be(uint8_t b1, uint8_t b2) {
-    return (b1 << 8) | b2;
+    return (uint16_t)(((uint16_t) b1 << 8) | (uint16_t) b2);
 }
 static inline uint16_t make_uint16_le(uint8_t b1, uint8_t b2) {
-    return (b2 << 8) | b1;
+    return (uint16_t)(((uint16_t) b2 << 8) | (uint16_t) b1);
 }
 static inline uint16_t get_uint16_be(const uint8_t *b) {
     return make_uint16_be(b[0], b[1]);
@@ -76,10 +76,10 @@ static inline uint8_t put_uint16_le(uint16_t n, uint8_t *b) {
 }
 
 static inline uint32_t make_uint32_be(uint8_t b1, uint8_t b2, uint8_t b3, uint8_t b4) {
-    return (b1 << 24) | (b2 << 16) | (b3 << 8) | b4;
+    return ((uint32_t) b1 << 24) | ((uint32_t) b2 << 16) | ((uint32_t) b3 << 8) | (uint32_t) b4;
 }
 static inline uint32_t make_uint32_le(uint8_t b1, uint8_t b2, uint8_t b3, uint8_t b4) {
-    return (b4 << 24) | (b3 << 16) | (b2 << 8) | b1;
+    return ((uint32_t) b4 << 24) | ((uint32_t) b3 << 16) | ((uint32_t) b2 << 8) | (uint32_t) b1;
 }
 static inline uint32_t get_uint32_be(const uint8_t *b) {
     return make_uint32_be(b[0], b[1], b[2], b[3]);
