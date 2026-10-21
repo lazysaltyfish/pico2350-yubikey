@@ -17,6 +17,7 @@
 
 #include "picokeys.h"
 #include "object_crypto_provider.h"
+#include "mbedtls/sha256.h"
 
 #include <assert.h>
 #include <stdio.h>
@@ -306,12 +307,81 @@ static void test_empty_internal_record(void) {
     file_object_crypto_provider_deinit(&provider);
 }
 
+static void test_interleaved_sha256_and_clone(void) {
+    static const uint8_t manifest_data[] = "manifest-part-1|manifest-part-2";
+    static const uint8_t record_plain[] = { 0x11, 0x22, 0x33, 0x44, 0x55, 0x66 };
+    file_object_crypto_provider_t provider;
+    test_root_context_t root;
+    test_root_reset(&root, 7);
+    test_provider_init(&provider, &root, TEST_NAMESPACE_A);
+
+    uint8_t expected_manifest_tag[FILE_OBJECT_AUTH_TAG_SIZE];
+    test_manifest_tag(&provider, CONST_BYTE_ARRAY(manifest_data, sizeof(manifest_data) - 1u), expected_manifest_tag);
+
+    const file_object_authenticator_t *auth = file_object_crypto_manifest_authenticator(&provider);
+    const file_object_record_protector_t *protector = file_object_crypto_record_protector(&provider);
+    assert(auth != NULL && protector != NULL);
+
+    /* Hold an active HMAC-SHA256 context open across interleaved SHA-256/HKDF/HMAC work. */
+    assert(auth->start(auth->ctx) == PICOKEYS_OK);
+    assert(auth->update(auth->ctx, CONST_BYTE_ARRAY(manifest_data, 16u)) == PICOKEYS_OK);
+
+    mbedtls_sha256_context sha_a;
+    mbedtls_sha256_context sha_b;
+    mbedtls_sha256_init(&sha_a);
+    mbedtls_sha256_init(&sha_b);
+
+    /* Re-starting an already started context without finish() must not deadlock. */
+    assert(mbedtls_sha256_starts(&sha_a, 0) == 0);
+    assert(mbedtls_sha256_update(&sha_a, manifest_data, 8u) == 0);
+    assert(mbedtls_sha256_starts(&sha_a, 0) == 0);
+    assert(mbedtls_sha256_update(&sha_a, manifest_data, 16u) == 0);
+
+    /* Cloning an active context must preserve independent intermediate digest state. */
+    mbedtls_sha256_clone(&sha_b, &sha_a);
+
+    file_object_record_identity_t identity = test_identity(TEST_NAMESPACE_A, FILE_OBJECT_PROTECTION_AUTHENTICATED_PUBLIC);
+    identity.logical_size = sizeof(record_plain);
+    uint8_t aad[FILE_OBJECT_RECORD_AAD_SIZE];
+    uint8_t nonce[FILE_OBJECT_RECORD_NONCE_SIZE];
+    uint8_t stored[sizeof(record_plain)];
+    uint8_t unsealed[sizeof(record_plain)];
+    uint8_t record_tag[FILE_OBJECT_AUTH_TAG_SIZE];
+    test_aad_build(&identity, aad, nonce);
+    assert(protector->seal(protector->ctx, &identity, nonce, aad, CONST_BYTE_ARRAY(record_plain, sizeof(record_plain)), &BYTE_BUFFER(stored, sizeof(stored)), record_tag) == PICOKEYS_OK);
+    assert(protector->unseal(protector->ctx, &identity, nonce, aad, CONST_BYTE_ARRAY(stored, sizeof(stored)), record_tag, &BYTE_BUFFER(unsealed, sizeof(unsealed))) == PICOKEYS_OK);
+    assert(memcmp(unsealed, record_plain, sizeof(record_plain)) == 0);
+
+    assert(mbedtls_sha256_update(&sha_a, manifest_data + 16u, sizeof(manifest_data) - 17u) == 0);
+    assert(mbedtls_sha256_update(&sha_b, manifest_data + 16u, sizeof(manifest_data) - 17u) == 0);
+
+    uint8_t digest_a[32];
+    uint8_t digest_b[32];
+    uint8_t digest_expected[32];
+    assert(mbedtls_sha256_finish(&sha_a, digest_a) == 0);
+    assert(mbedtls_sha256_finish(&sha_b, digest_b) == 0);
+    assert(mbedtls_sha256(manifest_data, sizeof(manifest_data) - 1u, digest_expected, 0) == 0);
+    assert(memcmp(digest_a, digest_expected, sizeof(digest_expected)) == 0);
+    assert(memcmp(digest_b, digest_expected, sizeof(digest_expected)) == 0);
+
+    mbedtls_sha256_free(&sha_a);
+    mbedtls_sha256_free(&sha_b);
+
+    uint8_t actual_manifest_tag[FILE_OBJECT_AUTH_TAG_SIZE];
+    assert(auth->update(auth->ctx, CONST_BYTE_ARRAY(manifest_data + 16u, sizeof(manifest_data) - 17u)) == PICOKEYS_OK);
+    assert(auth->finish(auth->ctx, actual_manifest_tag) == PICOKEYS_OK);
+    assert(memcmp(actual_manifest_tag, expected_manifest_tag, sizeof(expected_manifest_tag)) == 0);
+
+    file_object_crypto_provider_deinit(&provider);
+}
+
 int main(void) {
     test_initialization();
     test_manifest_authentication();
     test_authenticated_public_record();
     test_aead_secret_record();
     test_empty_internal_record();
+    test_interleaved_sha256_and_clone();
     puts("object_crypto_provider_test: OK");
     return 0;
 }

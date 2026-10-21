@@ -500,15 +500,6 @@ else()
         file(REMOVE "${CMAKE_CURRENT_BINARY_DIR}/secure_boot.json")
     endif()
 
-    list(APPEND INCLUDES
-        ${CMAKE_CURRENT_LIST_DIR}/config/rp2350/alt
-    )
-    target_include_directories(mbedtls PRIVATE
-        ${CMAKE_CURRENT_LIST_DIR}/config/rp2350/alt
-    )
-    target_link_libraries(mbedtls PRIVATE pico_sha256)
-    add_compile_definitions(MBEDTLS_SHA256_ALT=1)
-
     set(SOURCES
         ${CMAKE_CURRENT_LIST_DIR}/src/main.c
         ${CMAKE_CURRENT_LIST_DIR}/src/usb/usb.c
@@ -543,7 +534,6 @@ else()
         ${CMAKE_CURRENT_LIST_DIR}/src/led/led_ws2812.c
         ${CMAKE_CURRENT_LIST_DIR}/src/signal.c
         ${CMAKE_CURRENT_LIST_DIR}/src/vault.c
-        ${CMAKE_CURRENT_LIST_DIR}/config/rp2350/alt/sha256_alt.c
         ${CMAKE_CURRENT_LIST_DIR}/src/fido/fido.c
         ${CMAKE_CURRENT_LIST_DIR}/src/fido/sign_counter.c
         ${CMAKE_CURRENT_LIST_DIR}/src/fido/applet_storage.c
@@ -643,7 +633,6 @@ else()
             hardware_sync
             hardware_adc
             hardware_pio
-            pico_sha256
             pico_unique_id
             tinyusb_device
             tinyusb_board
