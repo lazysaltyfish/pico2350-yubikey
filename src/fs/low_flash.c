@@ -50,7 +50,7 @@ static page_flash_t flash_pages[TOTAL_FLASH_PAGES];
 
 static mutex_t mtx_flash;
 
-static bool locked_out = false;
+static volatile bool locked_out = false;
 
 static uint8_t ready_pages = 0;
 
@@ -85,16 +85,17 @@ static bool journal_pending = false, journal_finalize_pending = false;
 static uintptr_t pending_journal_addr;
 
 #define FLASH_SECTOR(x) ((x) & -FLASH_SECTOR_SIZE)
+#define FLASH_LOCKOUT_TIMEOUT_US 50000u
 
 static int do_flash_op_erase(uintptr_t addr) {
-    if (multicore_lockout_start_timeout_us(1000) == false) {
+    if (locked_out && multicore_lockout_start_timeout_us(FLASH_LOCKOUT_TIMEOUT_US) == false) {
         printf("WARN: FLASH LOCKOUT START TIMEOUT\n");
         return PICOKEYS_ERR_NO_MEMORY;
     }
     uint32_t ints = save_and_disable_interrupts();
     flash_range_erase(addr - XIP_BASE, FLASH_SECTOR_SIZE);
     restore_interrupts(ints);
-    if (multicore_lockout_end_timeout_us(1000) == false) {
+    if (locked_out && multicore_lockout_end_timeout_us(FLASH_LOCKOUT_TIMEOUT_US) == false) {
         printf("WARN: FLASH LOCKOUT END TIMEOUT\n");
         return PICOKEYS_EXEC_ERROR;
     }
@@ -102,14 +103,14 @@ static int do_flash_op_erase(uintptr_t addr) {
 }
 
 static int do_flash_op_program(uintptr_t addr, const uint8_t *data, size_t size) {
-    if (multicore_lockout_start_timeout_us(1000) == false) {
+    if (locked_out && multicore_lockout_start_timeout_us(FLASH_LOCKOUT_TIMEOUT_US) == false) {
         printf("WARN: FLASH LOCKOUT START TIMEOUT\n");
         return PICOKEYS_ERR_NO_MEMORY;
     }
     uint32_t ints = save_and_disable_interrupts();
     flash_range_program(addr - XIP_BASE, data, size);
     restore_interrupts(ints);
-    if (multicore_lockout_end_timeout_us(1000) == false) {
+    if (locked_out && multicore_lockout_end_timeout_us(FLASH_LOCKOUT_TIMEOUT_US) == false) {
         printf("WARN: FLASH LOCKOUT END TIMEOUT\n");
         return PICOKEYS_EXEC_ERROR;
     }
@@ -117,7 +118,7 @@ static int do_flash_op_program(uintptr_t addr, const uint8_t *data, size_t size)
 }
 
 static int do_flash_op_erase_program(uintptr_t addr, const uint8_t *data, size_t size) {
-    if (multicore_lockout_start_timeout_us(1000) == false) {
+    if (locked_out && multicore_lockout_start_timeout_us(FLASH_LOCKOUT_TIMEOUT_US) == false) {
         printf("WARN: FLASH LOCKOUT START TIMEOUT\n");
         return PICOKEYS_ERR_NO_MEMORY;
     }
@@ -125,7 +126,7 @@ static int do_flash_op_erase_program(uintptr_t addr, const uint8_t *data, size_t
     flash_range_erase(addr - XIP_BASE, FLASH_SECTOR_SIZE);
     flash_range_program(addr - XIP_BASE, data, size);
     restore_interrupts(ints);
-    if (multicore_lockout_end_timeout_us(1000) == false) {
+    if (locked_out && multicore_lockout_end_timeout_us(FLASH_LOCKOUT_TIMEOUT_US) == false) {
         printf("WARN: FLASH LOCKOUT END TIMEOUT\n");
         return PICOKEYS_EXEC_ERROR;
     }
@@ -150,7 +151,7 @@ static int journal_mark_done(void) {
 
 void low_flash_task(void) {
     if (mutex_try_enter(&mtx_flash, NULL) == true) {
-        if (locked_out == true && journal_finalize_pending) {
+        if (journal_finalize_pending) {
             int ret = journal_mark_done();
             if (ret == PICOKEYS_ERR_NO_MEMORY) {
                 printf("WARN: FLASH JOURNAL DONE WRITE FAILED\n");
@@ -160,7 +161,7 @@ void low_flash_task(void) {
                 printf("WARN: FLASH LOCKOUT END TIMEOUT AFTER JOURNAL DONE\n");
             }
         }
-        if (locked_out == true && flash_available == true && ready_pages > 0) {
+        if (flash_available == true && ready_pages > 0) {
             //printf(" DO_FLASH AVAILABLE\n");
             uintptr_t journal_sector = FLASH_SECTOR(last_base) - FLASH_SECTOR_SIZE;
             if (!journal_pending) {
@@ -494,6 +495,27 @@ void low_flash_init_core1(void) {
     multicore_lockout_victim_init();
     locked_out = true;
     mutex_exit(&mtx_flash);
+}
+
+bool low_flash_is_core1_locked_out(void) {
+    mutex_enter_blocking(&mtx_flash);
+    bool active = locked_out;
+    mutex_exit(&mtx_flash);
+    return active;
+}
+
+void low_flash_wait_core1(void) {
+    while (!low_flash_is_core1_locked_out()) {
+        tight_loop_contents();
+    }
+}
+
+void low_flash_stop_core1(void) {
+    mutex_enter_blocking(&mtx_flash);
+    multicore_reset_core1();
+    locked_out = false;
+    mutex_exit(&mtx_flash);
+    low_flash_task();
 }
 
 void low_flash_commit(void) {

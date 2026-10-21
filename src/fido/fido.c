@@ -694,7 +694,12 @@ int wait_button_pressed_timeout(uint32_t timeout_seconds) {
     queue_try_add(&card_to_usb_q, &val);
     do {
         queue_remove_blocking(&usb_to_card_q, &val);
-    } while (val != EV_BUTTON_PRESSED && val != EV_BUTTON_TIMEOUT && val != EV_BUTTON_CANCELLED);
+    } while (val != EV_BUTTON_PRESSED && val != EV_BUTTON_TIMEOUT &&
+             val != EV_BUTTON_CANCELLED && val != EV_EXIT);
+    if (val == EV_EXIT) {
+        queue_try_add(&usb_to_card_q, &val);
+        return 2;
+    }
 #endif
     if (val == EV_BUTTON_TIMEOUT) {
         return 1;

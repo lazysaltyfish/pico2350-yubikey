@@ -310,6 +310,9 @@ void *apdu_thread(void *arg) {
         queue_remove_blocking(&usb_to_card_q, &m);
         uint32_t flag = m + 1;
 
+        if (m == EV_BUTTON_PRESSED || m == EV_BUTTON_TIMEOUT || m == EV_BUTTON_CANCELLED) {
+            continue;
+        }
         if (m == EV_VERIFY_CMD_AVAILABLE || m == EV_MODIFY_CMD_AVAILABLE) {
             queue_add_blocking(&card_to_usb_q, &flag);
             set_res_sw(0x6f, 0x00);

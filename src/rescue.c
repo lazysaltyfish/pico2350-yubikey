@@ -201,7 +201,11 @@ static bool rescue_require_user_presence(void) {
     queue_add_blocking(&card_to_usb_q, &event);
     do {
         queue_remove_blocking(&usb_to_card_q, &event);
-    } while (event != EV_BUTTON_PRESSED && event != EV_BUTTON_TIMEOUT && event != EV_BUTTON_CANCELLED);
+    } while (event != EV_BUTTON_PRESSED && event != EV_BUTTON_TIMEOUT &&
+             event != EV_BUTTON_CANCELLED && event != EV_EXIT);
+    if (event == EV_EXIT) {
+        queue_try_add(&usb_to_card_q, &event);
+    }
     force_button_wait = previous_force;
     return event == EV_BUTTON_PRESSED;
 }

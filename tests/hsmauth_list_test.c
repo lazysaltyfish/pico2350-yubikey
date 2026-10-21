@@ -15,7 +15,13 @@
 
 /* Neither the clock nor the card worker runs in this single-threaded test. */
 #define TIME_H
-struct queue { unsigned unused; };
+struct queue {
+    uint32_t items[16];
+    unsigned head;
+    unsigned tail;
+    unsigned count;
+};
+static bool queue_try_add(queue_t *q, const void *value);
 static void queue_remove_blocking(queue_t *q, void *value);
 static void queue_add_blocking(queue_t *q, const void *value);
 
@@ -73,9 +79,29 @@ bool flash_commit_sync(uint32_t timeout_ms) { (void)timeout_ms; return true; }
 void timeout_stop(void) {}
 void otp_hid_execute_pending(void) {}
 void led_set_mode(uint32_t mode) { (void)mode; }
-void card_init_core1(void) { assert(false); }
-static void queue_remove_blocking(queue_t *q, void *value) { (void)q; (void)value; assert(false); }
-static void queue_add_blocking(queue_t *q, const void *value) { (void)q; (void)value; assert(false); }
+static unsigned core1_inits;
+static void (*on_card_queue_add)(uint32_t event);
+void card_init_core1(void) { core1_inits++; }
+static bool queue_try_add(queue_t *q, const void *value) {
+    assert(q->count < sizeof(q->items) / sizeof(q->items[0]));
+    uint32_t v = *(const uint32_t *)value;
+    q->items[q->tail] = v;
+    q->tail = (q->tail + 1) % (sizeof(q->items) / sizeof(q->items[0]));
+    q->count++;
+    if (q == &card_to_usb_q && on_card_queue_add) {
+        on_card_queue_add(v);
+    }
+    return true;
+}
+static void queue_remove_blocking(queue_t *q, void *value) {
+    assert(q->count > 0);
+    *(uint32_t *)value = q->items[q->head];
+    q->head = (q->head + 1) % (sizeof(q->items) / sizeof(q->items[0]));
+    q->count--;
+}
+static void queue_add_blocking(queue_t *q, const void *value) {
+    assert(queue_try_add(q, value));
+}
 
 file_t *file_search(uint16_t fid) {
     for (size_t i = 0; i < sizeof(test_files) / sizeof(test_files[0]); i++) {
@@ -325,6 +351,82 @@ static void test_invalid_stored_labels(void) {
     assert(tx_len == 2);
 }
 
+static unsigned button_cmd_calls;
+static unsigned exit_unload_calls;
+static bool exit_ack_saw_unload;
+
+static int button_abort_process_apdu(void) {
+    button_cmd_calls++;
+    uint32_t val = EV_PRESS_BUTTON_WITH_TIMEOUT(15);
+    queue_try_add(&card_to_usb_q, &val);
+    do {
+        queue_remove_blocking(&usb_to_card_q, &val);
+    } while (val != EV_BUTTON_PRESSED && val != EV_BUTTON_TIMEOUT &&
+             val != EV_BUTTON_CANCELLED && val != EV_EXIT);
+    if (val == EV_EXIT) {
+        queue_try_add(&usb_to_card_q, &val);
+        return SW_CONDITIONS_NOT_SATISFIED();
+    }
+    return SW_OK();
+}
+
+static int button_abort_unload(void) {
+    exit_unload_calls++;
+    apdu_clear_response_buffer();
+    return PICOKEYS_OK;
+}
+
+static void check_exit_ack_order(uint32_t event) {
+    if (event == EV_EXIT + 1) {
+        exit_ack_saw_unload = (exit_unload_calls == 1 && current_app == NULL && !response_pending);
+    }
+}
+
+static void test_apdu_thread_exit_during_button_wait(void) {
+    reset_fixture();
+    memset(&usb_to_card_q, 0, sizeof(usb_to_card_q));
+    memset(&card_to_usb_q, 0, sizeof(card_to_usb_q));
+    core1_inits = button_cmd_calls = exit_unload_calls = 0;
+    exit_ack_saw_unload = false;
+    on_card_queue_add = check_exit_ack_order;
+
+    uint8_t dummy_hdr[4] = { 0x00, 0x01, 0x00, 0x00 };
+    memset(&transport, 0xA5, sizeof(transport));
+    apdu.header = dummy_hdr;
+    apdu.rdata = transport.usb + 10;
+    apdu.ne = 256;
+    current_app = &apps[0];
+    current_app->process_apdu = button_abort_process_apdu;
+    current_app->unload = button_abort_unload;
+
+    /* Queue a command that blocks in a button wait, followed by a stale button
+     * event and EV_EXIT from Core 0 card_exit(). */
+    uint32_t ev_cmd = EV_CMD_AVAILABLE;
+    uint32_t ev_exit = EV_EXIT;
+    uint32_t ev_stale_btn = EV_BUTTON_CANCELLED;
+    queue_add_blocking(&usb_to_card_q, &ev_cmd);
+    queue_add_blocking(&usb_to_card_q, &ev_exit);
+    queue_add_blocking(&usb_to_card_q, &ev_stale_btn);
+
+    apdu_thread(NULL);
+
+    assert(core1_inits == 1);
+    assert(button_cmd_calls == 1);
+    assert(exit_unload_calls == 1);
+    assert(exit_ack_saw_unload);
+    assert(current_app == NULL);
+    assert(usb_to_card_q.count == 0);
+    assert(card_to_usb_q.count == 3);
+    uint32_t out = 0;
+    queue_remove_blocking(&card_to_usb_q, &out);
+    assert((out & 0xffu) == EV_PRESS_BUTTON);
+    queue_remove_blocking(&card_to_usb_q, &out);
+    assert(out == EV_EXEC_FINISHED);
+    queue_remove_blocking(&card_to_usb_q, &out);
+    assert(out == EV_EXIT + 1);
+    on_card_queue_add = NULL;
+}
+
 int main(void) {
     verify_list(0, 1, 0, false, ITF_SC_CCID);
     verify_list(1, 1, 0, false, ITF_SC_CCID);
@@ -338,6 +440,7 @@ int main(void) {
     test_pending_response_invalidation();
     test_invalid_stored_labels();
     test_inline_response_compatibility();
+    test_apdu_thread_exit_during_button_wait();
     puts("hsmauth_list_test: OK");
     return 0;
 }

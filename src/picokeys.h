@@ -51,6 +51,9 @@
 extern int picokey_init(void);
 
 extern void low_flash_init_core1(void);
+extern void low_flash_stop_core1(void);
+extern void low_flash_wait_core1(void);
+extern bool low_flash_is_core1_locked_out(void);
 
 static inline uint16_t make_uint16_be(uint8_t b1, uint8_t b2) {
     return (uint16_t)(((uint16_t) b1 << 8) | (uint16_t) b2);

@@ -20,9 +20,11 @@
 #include "led/led.h"
 #include "button.h"
 #include "pico_time.h"
+#if defined(PICO_PLATFORM)
 #include "pico/bootrom.h"
 #include "pico/multicore.h"
 #include "hardware/sync.h"
+#endif
 #define multicore_launch_func_core1(a) multicore_launch_core1((void (*) (void))a)
 #include "apdu.h"
 #include "tusb.h"
@@ -160,6 +162,8 @@ static void __attribute__((noreturn, noinline)) usb_secure_reboot_now(void) {
     uintptr_t new_sp = (((uintptr_t) reboot_temp_stack) + sizeof(reboot_temp_stack)) & ~(uintptr_t)0x7;
 #if defined(__arm__) || defined(__thumb__)
     __asm volatile ("msr msp, %0" :: "r"(new_sp) : "memory");
+#else
+    (void)new_sp;
 #endif
 
     if (heap_end > heap_start) {
@@ -193,16 +197,22 @@ bool is_busy(void) {
 
 void usb_send_event(uint32_t flag) {
     mutex_enter_blocking(&mutex);
-    queue_add_blocking(&usb_to_card_q, &flag);
+    while (!queue_try_add(&usb_to_card_q, &flag)) {
+        flash_task();
+        tight_loop_contents();
+    }
     if (flag == EV_CMD_AVAILABLE) {
         timeout_start();
     }
     mutex_exit(&mutex);
 
     if (flag != EV_CMD_AVAILABLE) {
-        uint32_t m;
+        uint32_t m = 0;
         do {
-            queue_remove_blocking(&card_to_usb_q, &m);
+            while (!queue_try_remove(&card_to_usb_q, &m)) {
+                flash_task();
+                tight_loop_contents();
+            }
         } while (m != flag + 1);
     }
 }
@@ -219,32 +229,29 @@ void card_start(uint8_t itf, void *(*func)(void *)) {
         if (card_locked_itf != ITF_TOTAL || card_locked_func != NULL) {
             card_exit();
         }
-        if (func) {
-            multicore_reset_core1();
-            multicore_launch_func_core1(func);
-        }
-        led_set_mode(MODE_MOUNTED);
         card_locked_itf = itf;
         card_locked_func = func;
+        if (func) {
+            low_flash_stop_core1();
+            multicore_launch_func_core1(func);
+            low_flash_wait_core1();
+        }
+        led_set_mode(MODE_MOUNTED);
     }
 }
 
 void card_exit(void) {
     if (card_locked_itf != ITF_TOTAL || card_locked_func != NULL) {
+        button_wait_abort();
         usb_send_event(EV_EXIT);
         uint32_t m;
-        while (queue_is_empty(&usb_to_card_q) == false) {
-            if (queue_try_remove(&usb_to_card_q, &m) == false) {
-                break;
-            }
+        while (queue_try_remove(&usb_to_card_q, &m)) {
         }
-        while (queue_is_empty(&card_to_usb_q) == false) {
-            mutex_enter_blocking(&mutex);
-            if (queue_try_remove(&card_to_usb_q, &m) == false) {
-                break;
-            }
-            mutex_exit(&mutex);
+        mutex_enter_blocking(&mutex);
+        while (queue_try_remove(&card_to_usb_q, &m)) {
         }
+        mutex_exit(&mutex);
+        low_flash_stop_core1();
         led_set_mode(MODE_SUSPENDED);
     }
     card_locked_itf = ITF_TOTAL;

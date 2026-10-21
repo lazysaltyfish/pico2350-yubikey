@@ -19,10 +19,12 @@
 #include "button.h"
 #include "led/led.h"
 #include "pico_time.h"
+#if defined(PICO_PLATFORM)
 #include "pico/multicore.h"
 #include "hardware/sync.h"
 #include "hardware/structs/ioqspi.h"
 #include "hardware/gpio.h"
+#endif
 #include "usb.h"
 #include "signal.h"
 
@@ -45,6 +47,7 @@ volatile bool cancel_button = false;
 bool touch_accept_button = false;
 volatile bool force_button_wait = false;
 
+#if defined(PICO_PLATFORM)
 static bool __no_inline_not_in_flash_func(picok_get_bootsel_button)(void) {
     const uint CS_PIN_INDEX = 1;
 
@@ -78,6 +81,11 @@ static bool __no_inline_not_in_flash_func(picok_get_bootsel_button)(void) {
 static bool picok_board_button_read(void) {
   return picok_get_bootsel_button();
 }
+#else
+WEAK bool picok_board_button_read(void) {
+  return false;
+}
+#endif
 static bool button_pressed_state = false;
 static uint32_t button_pressed_time = 0;
 static uint8_t button_press = 0;
@@ -113,6 +121,15 @@ void button_wait_start_timeout(uint32_t timeout_seconds) {
     async_button_led_mode = led_get_mode();
     req_button_pending = true;
     led_set_mode(MODE_BUTTON);
+}
+
+void button_wait_abort(void) {
+    if (async_button_wait || req_button_pending) {
+        async_button_wait = false;
+        req_button_pending = false;
+        led_set_mode(async_button_led_mode);
+    }
+    cancel_button = false;
 }
 
 static bool last_locked_button_state = false;
@@ -174,11 +191,14 @@ uint32_t button_timeout_seconds(void) {
 void button_task(void) {
     uint32_t now = board_millis();
     if (now > 1000 && now - button_last_poll >= 10 && (async_button_wait || !is_busy())) { // wait 1 second to boot up
-        if (!multicore_lockout_start_timeout_us(1000)) {
+        bool locked = low_flash_is_core1_locked_out();
+        if (locked && !multicore_lockout_start_timeout_us(1000)) {
             return;
         }
         bool current_button_state = picok_board_button_read();
-        multicore_lockout_end_timeout_us(1000);
+        if (locked) {
+            multicore_lockout_end_timeout_us(1000);
+        }
         last_locked_button_state = current_button_state;
         button_last_poll = now;
         if (async_button_wait) {

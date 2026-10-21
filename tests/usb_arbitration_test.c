@@ -114,7 +114,9 @@ bool usbd_edpt_open(uint8_t rhport, const tusb_desc_endpoint_t *endpoint) {
 bool usbd_edpt_xfer(uint8_t rhport, uint8_t endpoint, uint8_t *data, uint16_t size) {
     (void)rhport; (void)endpoint; (void)data; (void)size; return true;
 }
-void led_set_mode(uint32_t mode) { (void)mode; }
+static uint32_t current_led_mode = MODE_MOUNTED;
+void led_set_mode(uint32_t mode) { current_led_mode = mode; }
+uint32_t led_get_mode(void) { return current_led_mode; }
 uint16_t apdu_limit_response(uint16_t next, uint16_t maximum) { return next < maximum ? next : maximum; }
 
 static uint8_t active_header[4] = { 0, 0x87, 0x11, 0x9A };
@@ -416,6 +418,169 @@ static void test_hid_defers_applet_selection_to_core1_worker(void) {
     assert(apps_selected == 1 && last_selected_aid == fido_aid + 1);
 }
 
+/* Exercise production src/usb/usb.c and src/button.c multicore lifecycle. */
+#include "signal.h"
+typedef struct { uint16_t idVendor; uint16_t idProduct; } tusb_desc_device_t;
+typedef struct { int locked; } mutex_t;
+struct queue {
+    uint32_t items[64];
+    unsigned head;
+    unsigned tail;
+    unsigned count;
+};
+static void mutex_init(mutex_t *m) { m->locked = 0; }
+static void mutex_enter_blocking(mutex_t *m) { assert(m->locked == 0); m->locked = 1; }
+static void mutex_exit(mutex_t *m) { assert(m->locked == 1); m->locked = 0; }
+static void queue_init(queue_t *q, size_t item_size, unsigned depth) {
+    (void)item_size; (void)depth;
+    memset(q, 0, sizeof(*q));
+}
+static bool queue_try_add(queue_t *q, const void *value) {
+    if (q->count >= sizeof(q->items) / sizeof(q->items[0])) return false;
+    q->items[q->tail] = *(const uint32_t *)value;
+    q->tail = (q->tail + 1) % (sizeof(q->items) / sizeof(q->items[0]));
+    q->count++;
+    return true;
+}
+static bool queue_try_remove(queue_t *q, void *value) {
+    if (q->count == 0) return false;
+    *(uint32_t *)value = q->items[q->head];
+    q->head = (q->head + 1) % (sizeof(q->items) / sizeof(q->items[0]));
+    q->count--;
+    return true;
+}
+static uint32_t save_and_disable_interrupts(void) { return 0; }
+static void tight_loop_contents(void) {}
+static void reset_usb_boot(uint32_t a, uint32_t b) { (void)a; (void)b; }
+char __end__, __HeapLimit, __StackBottom, __StackTop, __StackOneBottom, __StackOneTop;
+tusb_desc_device_t desc_device;
+char *string_desc_itf[5];
+char *string_desc_arr[10];
+phy_data_t phy_data;
+int set_atr(void) { return PICOKEYS_OK; }
+void otp_hid_task(void) {}
+int signal_emit(signal_code_t code) { (void)code; return 0; }
+int signal_emit_param(signal_code_t code, void *data) { (void)code; (void)data; return 0; }
+
+static bool core1_locked_out;
+static unsigned flash_tasks_run, core1_stops, core1_waits, core1_launches, lockout_starts, lockout_ends;
+static bool pending_core1_flash_sync;
+void low_flash_init_core1(void) { core1_locked_out = true; }
+void low_flash_stop_core1(void) { core1_stops++; core1_locked_out = false; }
+void low_flash_wait_core1(void) { core1_waits++; assert(core1_locked_out); }
+bool low_flash_is_core1_locked_out(void) { return core1_locked_out; }
+static void multicore_reset_core1(void) { core1_locked_out = false; }
+static void multicore_launch_core1(void (*entry)(void)) {
+    (void)entry;
+    core1_launches++;
+    core1_locked_out = true;
+}
+static bool multicore_lockout_start_timeout_us(uint64_t timeout_us) {
+    (void)timeout_us;
+    assert(core1_locked_out);
+    lockout_starts++;
+    return true;
+}
+static bool multicore_lockout_end_timeout_us(uint64_t timeout_us) {
+    (void)timeout_us;
+    assert(core1_locked_out);
+    lockout_ends++;
+    return true;
+}
+
+#define ITF_HID_CTAP real_ITF_HID_CTAP
+#define ITF_HID_KB real_ITF_HID_KB
+#define ITF_HID real_ITF_HID
+#define ITF_KEYBOARD real_ITF_KEYBOARD
+#define ITF_HID_TOTAL real_ITF_HID_TOTAL
+#define ITF_SC_CCID real_ITF_SC_CCID
+#define ITF_SC_WCID real_ITF_SC_WCID
+#define ITF_CCID real_ITF_CCID
+#define ITF_WCID real_ITF_WCID
+#define ITF_SC_TOTAL real_ITF_SC_TOTAL
+#define ITF_TOTAL real_ITF_TOTAL
+#define finished_data_size real_finished_data_size
+#define usb_set_timeout_counter real_usb_set_timeout_counter
+#define timeout_stop real_timeout_stop
+#define timeout_start real_timeout_start
+#define card_active_interface real_card_active_interface
+#define is_busy real_is_busy
+#define usb_send_event real_usb_send_event
+#define card_init_core1 real_card_init_core1
+#define card_start real_card_start
+#define card_exit real_card_exit
+#define card_status real_card_status
+#define cancel_button real_cancel_button
+#define is_req_button_pending real_is_req_button_pending
+
+void real_card_exit(void);
+void flash_task(void);
+#include "../src/usb/usb.c"
+#include "../src/button.c"
+
+void flash_task(void) {
+    flash_tasks_run++;
+    if (pending_core1_flash_sync) {
+        /* Simulate Core 1 completing low_flash_commit_sync() once Core 0 runs
+         * flash_task(), then sending EV_EXIT + 1. */
+        pending_core1_flash_sync = false;
+        uint32_t ack = EV_EXIT + 1;
+        assert(queue_try_add(&card_to_usb_q, &ack));
+    }
+}
+
+static void test_multicore_card_lifecycle_and_flash_sync_service(void) {
+    queue_init(&usb_to_card_q, sizeof(uint32_t), 64);
+    queue_init(&card_to_usb_q, sizeof(uint32_t), 64);
+    mutex_init(&mutex);
+    real_ITF_TOTAL = 4;
+    card_locked_itf = real_ITF_TOTAL;
+    card_locked_func = NULL;
+    core1_locked_out = false;
+    flash_tasks_run = core1_stops = core1_waits = core1_launches = lockout_starts = lockout_ends = 0;
+
+    /* Button polling while Core 1 is stopped must not attempt multicore lockout. */
+    test_clock_ms = 2000;
+    real_timeout_stop();
+    button_task();
+    assert(lockout_starts == 0 && lockout_ends == 0);
+
+    /* Starting a worker stops any residual Core 1 state, launches, and waits for lockout init. */
+    real_card_start(1, apdu_thread);
+    assert(core1_stops == 1 && core1_launches == 1 && core1_waits == 1);
+    assert(core1_locked_out && real_card_active_interface() == 1);
+
+    /* Button polling while Core 1 is running must bracket QSPI reads with multicore lockout. */
+    test_clock_ms = 2020;
+    real_timeout_stop();
+    button_task();
+    assert(lockout_starts == 1 && lockout_ends == 1);
+
+    /* Starting a user-presence wait and then calling card_exit() must abort the button wait,
+     * service flash_task() while waiting for EV_EXIT + 1, release mutex, and stop Core 1. */
+    current_led_mode = MODE_MOUNTED;
+    phy_data.up_btn_present = true;
+    phy_data.up_btn = 15;
+    button_wait_start_timeout(15);
+    assert(real_is_req_button_pending() && async_button_wait && current_led_mode == MODE_BUTTON);
+    real_cancel_button = true;
+    pending_core1_flash_sync = true;
+
+    /*Switching to cbor_thread triggers card_exit() on the previous worker. */
+    real_card_start(0, cbor_thread);
+    assert(!pending_core1_flash_sync && flash_tasks_run >= 1);
+    assert(!real_is_req_button_pending() && !async_button_wait && !real_cancel_button);
+    assert(mutex.locked == 0);
+    assert(core1_stops == 3 && core1_launches == 2 && core1_waits == 2);
+    assert(core1_locked_out && real_card_active_interface() == 0);
+
+    /* Explicit card_exit() leaves Core 1 stopped and unlocked. */
+    pending_core1_flash_sync = true;
+    real_card_exit();
+    assert(!core1_locked_out && mutex.locked == 0);
+    assert(real_card_active_interface() == real_ITF_TOTAL);
+}
+
 int main(void) {
     test_busy_reply_completion_preserves_active_buffers();
     test_busy_submission_failure_does_not_consume_an_active_report();
@@ -425,6 +590,7 @@ int main(void) {
     test_ccid_fifo_waits_for_the_active_worker();
     test_ccid_power_on_returns_configured_atr();
     test_hid_defers_applet_selection_to_core1_worker();
+    test_multicore_card_lifecycle_and_flash_sync_service();
     puts("USB HID/CCID arbitration regression tests passed");
     return 0;
 }

@@ -37,6 +37,7 @@ extern bool touch_accept_button;
 extern volatile bool force_button_wait;
 extern uint32_t button_timeout_seconds(void);
 extern void button_wait_start_timeout(uint32_t timeout_seconds);
+extern void button_wait_abort(void);
 
 extern int (*button_pressed_cb)(uint8_t);
 

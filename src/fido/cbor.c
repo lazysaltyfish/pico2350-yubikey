@@ -124,11 +124,15 @@ void *cbor_thread(void *arg) {
         queue_remove_blocking(&usb_to_card_q, &m);
         uint32_t flag = m + 1;
 
+        if (m == EV_BUTTON_PRESSED || m == EV_BUTTON_TIMEOUT || m == EV_BUTTON_CANCELLED) {
+            continue;
+        }
         if (m == EV_EXIT) {
             if (current_app && current_app->unload) {
                 current_app->unload();
                 current_app = NULL;
             }
+            apdu_clear_response_buffer();
             queue_add_blocking(&card_to_usb_q, &flag);
             break;
         }
