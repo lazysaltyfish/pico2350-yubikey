@@ -81,6 +81,31 @@ static bool is_empty_otp_buffer(uint16_t row, uint16_t len) {
     return is_empty_buffer(CONST_BYTE_ARRAY(otp_buffer_raw(row), len * 2));
 }
 
+static bool is_invalidated_otp_buffer(uint16_t row, uint16_t len) {
+    const uint8_t *raw = otp_buffer_raw(row);
+    size_t raw_len = (size_t)len * 2u;
+    for (size_t i = 0; i < raw_len; i++) {
+        uint8_t expected = ((i & 3u) == 3u) ? 0x00u : 0xFFu;
+        if (raw[i] != expected) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool is_valid_otp_chaff(uint16_t row, uint16_t len) {
+    const uint8_t *raw = otp_buffer_raw(row);
+    const uint8_t *chaff = otp_buffer_raw(row + 32);
+    size_t raw_len = (size_t)len * 2u;
+    for (size_t i = 0; i < raw_len; i++) {
+        uint8_t expected = ((i & 3u) == 3u) ? 0x00u : (uint8_t)(raw[i] ^ 0xFFu);
+        if (chaff[i] != expected) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static bool is_otp_locked_page(uint8_t page) {
     const uint8_t *lock1 = otp_buffer_raw(OTP_DATA_PAGE0_LOCK0_ROW + page * 2 + 1);
     return (lock1[0] == 0x3C && lock1[1] == 0x3C && lock1[2] == 0x3C);
@@ -99,22 +124,28 @@ static int otp_invalidate_key(uint16_t row, uint16_t len) {
     if (len == 0 || (len & 1u) != 0 || len > 32) {
         return BOOTROM_ERROR_INVALID_STATE;
     }
-    if (!is_empty_otp_buffer(row, len)) {
-        size_t rows = (size_t)len / 2u;
-        alignas(4) uint32_t inval[16] = {0};
-        for (size_t i = 0; i < rows; i++) {
-            inval[i] = 0x00FFFFFFu;
-        }
-        int ret = otp_write_data_raw(row, CONST_BYTE_ARRAY((const uint8_t *)inval, rows * sizeof(uint32_t)));
-        mbedtls_platform_zeroize(inval, sizeof(inval));
-        return ret;
+    if (is_empty_otp_buffer(row, len) || is_invalidated_otp_buffer(row, len)) {
+        return BOOTROM_OK;
     }
-    return BOOTROM_OK;
+    size_t rows = (size_t)len / 2u;
+    alignas(4) uint32_t inval[16] = {0};
+    for (size_t i = 0; i < rows; i++) {
+        inval[i] = 0x00FFFFFFu;
+    }
+    int ret = otp_write_data_raw(row, CONST_BYTE_ARRAY((const uint8_t *)inval, rows * sizeof(uint32_t)));
+    mbedtls_platform_zeroize(inval, sizeof(inval));
+    if (ret == BOOTROM_OK && !is_invalidated_otp_buffer(row, len)) {
+        return BOOTROM_ERROR_INVALID_STATE;
+    }
+    return ret;
 }
 
 static int otp_chaff(uint16_t row, uint16_t len) {
     if (len == 0 || (len & 1u) != 0 || len > 32) {
         return BOOTROM_ERROR_INVALID_STATE;
+    }
+    if (!is_empty_otp_buffer(row, len) && is_valid_otp_chaff(row, len)) {
+        return BOOTROM_OK;
     }
     size_t raw_len = (size_t)len * 2u;
     const uint8_t *raw = otp_buffer_raw(row);
@@ -125,34 +156,56 @@ static int otp_chaff(uint16_t row, uint16_t len) {
     }
     int ret = otp_write_data_raw(row + 32, CONST_BYTE_ARRAY(chaff, raw_len));
     mbedtls_platform_zeroize(chaff_words, sizeof(chaff_words));
+    if (ret == BOOTROM_OK && !is_valid_otp_chaff(row, len)) {
+        return BOOTROM_ERROR_INVALID_STATE;
+    }
     return ret;
 }
 
 static int otp_migrate_key(uint16_t new_row, uint16_t old_row, uint16_t len) {
-    if (is_empty_otp_buffer(new_row, len) && !is_empty_otp_buffer(old_row, len)) {
-        const uint8_t *key = otp_buffer(old_row);
-        uint8_t *new_key = (uint8_t *)calloc(len, sizeof(uint8_t));
-        if (new_key) {
-            memcpy(new_key, key, len);
-            int ret = otp_write_data(new_row, CONST_BYTE_ARRAY(new_key, len));
-            if (ret == BOOTROM_OK) {
-                ret = otp_chaff(new_row, len);
+    if (len == 0 || (len & 1u) != 0 || len > 32) {
+        return BOOTROM_ERROR_INVALID_STATE;
+    }
+    if (is_empty_otp_buffer(old_row, len) || is_invalidated_otp_buffer(old_row, len)) {
+        if (!is_empty_otp_buffer(new_row, len) && !is_valid_otp_chaff(new_row, len)) {
+            return otp_chaff(new_row, len);
+        }
+        return BOOTROM_OK;
+    }
+
+    alignas(2) uint8_t new_key[32] = {0};
+    memcpy(new_key, otp_buffer(old_row), len);
+    int ret = BOOTROM_OK;
+    if (is_empty_otp_buffer(new_row, len)) {
+        ret = otp_write_data(new_row, CONST_BYTE_ARRAY(new_key, len));
+    } else if (memcmp(otp_buffer(new_row), new_key, len) != 0) {
+        for (uint16_t r = 0; r < len / 2u; r++) {
+            if (is_empty_otp_buffer((uint16_t)(new_row + r), 2)) {
+                ret = otp_write_data((uint16_t)(new_row + r), CONST_BYTE_ARRAY(new_key + r * 2u, 2));
                 if (ret != BOOTROM_OK) {
-                    printf("Error writing migrated OTP chaff [%d]\n", ret);
+                    break;
                 }
             }
-            if (ret == BOOTROM_OK) {
-                ret = otp_invalidate_key(old_row, len);
-                if (ret != BOOTROM_OK) {
-                    printf("Error invalidating old OTP key [%d]\n", ret);
-                }
-            }
-            mbedtls_platform_zeroize(new_key, len);
-            free(new_key);
-            return ret;
         }
     }
-    return BOOTROM_ERROR_INVALID_STATE;
+    if (ret == BOOTROM_OK && memcmp(otp_buffer(new_row), new_key, len) != 0) {
+        ret = BOOTROM_ERROR_INVALID_STATE;
+    }
+    mbedtls_platform_zeroize(new_key, sizeof(new_key));
+
+    if (ret == BOOTROM_OK) {
+        ret = otp_chaff(new_row, len);
+        if (ret != BOOTROM_OK) {
+            printf("Error writing migrated OTP chaff [%d]\n", ret);
+        }
+    }
+    if (ret == BOOTROM_OK) {
+        ret = otp_invalidate_key(old_row, len);
+        if (ret != BOOTROM_OK) {
+            printf("Error invalidating old OTP key [%d]\n", ret);
+        }
+    }
+    return ret;
 }
 
 static void otp_migrate_chaff(void) {
@@ -270,57 +323,98 @@ err:
 }
 
 void otp_platform_init(const uint8_t **otp_key_1_out, const uint8_t **otp_key_2_out) {
+    *otp_key_1_out = NULL;
+    *otp_key_2_out = NULL;
+
     otp_migrate_chaff();
 
     int ret = 0;
-    uint16_t write_otp[2] = {0xFFFF, 0xFFFF};
+    bool key1_ok = false;
+    bool key2_ok = false;
+
     if (is_empty_otp_buffer(OTP_KEY_1, 32)) {
-        uint8_t mkek[32] = {0};
-        random_fill_buffer(BYTE_ARRAY(mkek, sizeof(mkek)));
-        ret = otp_write_data(OTP_KEY_1, CONST_BYTE_ARRAY(mkek, sizeof(mkek)));
-        mbedtls_platform_zeroize(mkek, sizeof(mkek));
-        if (ret != 0) {
-            printf("Error writing OTP key 1 [%d]\n", ret);
-        } else {
-            ret = otp_chaff(OTP_KEY_1, 32);
-            if (ret != 0) {
-                printf("Error writing OTP key 1 chaff [%d]\n", ret);
-            } else {
-                write_otp[0] = OTP_KEY_1;
+        alignas(2) uint8_t mkek[32] = {0};
+        if (random_fill_buffer(BYTE_ARRAY(mkek, sizeof(mkek))) == PICOKEYS_OK &&
+            !is_empty_buffer(CONST_BYTE_ARRAY(mkek, sizeof(mkek)))) {
+            ret = otp_write_data(OTP_KEY_1, CONST_BYTE_ARRAY(mkek, sizeof(mkek)));
+            if (ret == BOOTROM_OK && memcmp(otp_buffer(OTP_KEY_1), mkek, sizeof(mkek)) != 0) {
+                ret = BOOTROM_ERROR_INVALID_STATE;
             }
+            if (ret != BOOTROM_OK) {
+                printf("Error writing OTP key 1 [%d]\n", ret);
+            } else {
+                ret = otp_chaff(OTP_KEY_1, 32);
+                if (ret != BOOTROM_OK) {
+                    printf("Error writing OTP key 1 chaff [%d]\n", ret);
+                } else {
+                    key1_ok = true;
+                }
+            }
+        } else {
+            printf("Error generating OTP key 1\n");
+        }
+        mbedtls_platform_zeroize(mkek, sizeof(mkek));
+    } else {
+        ret = otp_chaff(OTP_KEY_1, 32);
+        if (ret != BOOTROM_OK) {
+            printf("Error writing OTP key 1 chaff [%d]\n", ret);
+        } else {
+            key1_ok = true;
         }
     }
-    *otp_key_1_out = otp_buffer(OTP_KEY_1);
+    if (!is_empty_otp_buffer(OTP_KEY_1, 32)) {
+        *otp_key_1_out = otp_buffer(OTP_KEY_1);
+    }
 
     if (is_empty_otp_buffer(OTP_KEY_2, 32)) {
         mbedtls_ecdsa_context ecdsa;
         size_t olen = 0;
-        uint8_t pkey[MBEDTLS_ECP_MAX_BYTES];
-        while (olen != 32) {
+        alignas(2) uint8_t pkey[MBEDTLS_ECP_MAX_BYTES] = {0};
+        int gen_ret = -1;
+        for (int attempt = 0; attempt < 8 && olen != 32; attempt++) {
+            olen = 0;
             mbedtls_ecdsa_init(&ecdsa);
-            mbedtls_ecp_group_id ec_id = MBEDTLS_ECP_DP_SECP256K1;
-            mbedtls_ecdsa_genkey(&ecdsa, ec_id, random_fill_iterator, NULL);
-            mbedtls_ecp_write_key_ext(&ecdsa, &olen, pkey, sizeof(pkey));
+            gen_ret = mbedtls_ecdsa_genkey(&ecdsa, MBEDTLS_ECP_DP_SECP256K1, random_fill_iterator, NULL);
+            if (gen_ret == 0) {
+                gen_ret = mbedtls_ecp_write_key_ext(&ecdsa, &olen, pkey, sizeof(pkey));
+            }
             mbedtls_ecdsa_free(&ecdsa);
-        }
-        ret = otp_write_data(OTP_KEY_2, CONST_BYTE_ARRAY(pkey, olen));
-        mbedtls_platform_zeroize(pkey, sizeof(pkey));
-        if (ret != 0) {
-            printf("Error writing OTP key 2 [%d]\n", ret);
-        } else {
-            ret = otp_chaff(OTP_KEY_2, 32);
-            if (ret != 0) {
-                printf("Error writing OTP key 2 chaff [%d]\n", ret);
-            } else {
-                write_otp[1] = OTP_KEY_2;
+            if (gen_ret != 0) {
+                break;
             }
         }
-    }
-    *otp_key_2_out = otp_buffer(OTP_KEY_2);
-
-    for (size_t i = 0; i < sizeof(write_otp) / sizeof(write_otp[0]); i++) {
-        if (write_otp[i] != 0xFFFF) {
-            otp_lock_page(write_otp[i] >> 6);
+        if (gen_ret == 0 && olen == 32 && !is_empty_buffer(CONST_BYTE_ARRAY(pkey, 32))) {
+            ret = otp_write_data(OTP_KEY_2, CONST_BYTE_ARRAY(pkey, olen));
+            if (ret == BOOTROM_OK && memcmp(otp_buffer(OTP_KEY_2), pkey, olen) != 0) {
+                ret = BOOTROM_ERROR_INVALID_STATE;
+            }
+            if (ret != BOOTROM_OK) {
+                printf("Error writing OTP key 2 [%d]\n", ret);
+            } else {
+                ret = otp_chaff(OTP_KEY_2, 32);
+                if (ret != BOOTROM_OK) {
+                    printf("Error writing OTP key 2 chaff [%d]\n", ret);
+                } else {
+                    key2_ok = true;
+                }
+            }
+        } else {
+            printf("Error generating OTP key 2 [%d]\n", gen_ret);
         }
+        mbedtls_platform_zeroize(pkey, sizeof(pkey));
+    } else {
+        ret = otp_chaff(OTP_KEY_2, 32);
+        if (ret != BOOTROM_OK) {
+            printf("Error writing OTP key 2 chaff [%d]\n", ret);
+        } else {
+            key2_ok = true;
+        }
+    }
+    if (!is_empty_otp_buffer(OTP_KEY_2, 32)) {
+        *otp_key_2_out = otp_buffer(OTP_KEY_2);
+    }
+
+    if (key1_ok && key2_ok) {
+        otp_lock_page(OTP_KEY_1 >> 6);
     }
 }
