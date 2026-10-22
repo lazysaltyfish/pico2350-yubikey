@@ -293,6 +293,11 @@ if(ENABLE_EMULATION)
     add_test(NAME verification_runner_test COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_LIST_DIR}/tests/verification_runner_test.py")
     add_test(NAME secure_boot_key_test COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_LIST_DIR}/tests/secure_boot_key_test.py")
 
+    add_executable(low_flash_journal_test tests/low_flash_journal_test.c)
+    target_include_directories(low_flash_journal_test PRIVATE ${INCLUDES})
+    target_compile_options(low_flash_journal_test PRIVATE -Wall -Wextra -Wshadow -Werror -UNDEBUG)
+    add_test(NAME low_flash_journal_test COMMAND low_flash_journal_test)
+
     add_executable(hsmauth_security_test tests/hsmauth_security_test.c src/fido/applet_storage.c src/fido/applet_txn.c)
     target_include_directories(hsmauth_security_test PRIVATE ${INCLUDES} ${SYSTEM_INCLUDES})
     target_compile_options(hsmauth_security_test PRIVATE -Wall -Wextra -Wshadow -Werror -UNDEBUG)

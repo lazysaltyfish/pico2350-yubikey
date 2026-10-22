@@ -27,14 +27,15 @@
 #include "pico/multicore.h"
 #include "pico/bootrom.h"
 #include "boot/picobin.h"
+#include "low_flash_journal.h"
 
 extern uint32_t FLASH_SIZE_BYTES;
 
-#define TOTAL_FLASH_PAGES 6
 #define FLASH_CACHE_FLUSH_TIMEOUT_MS 5000u
 
 extern const uintptr_t start_data_pool;
 extern const uintptr_t end_data_pool;
+extern const uintptr_t start_rom_pool;
 extern const uintptr_t end_rom_pool;
 
 PACK(
@@ -64,20 +65,9 @@ extern uintptr_t last_base;
 
 static uint8_t data_page[FLASH_PAGE_SIZE];
 
-PACK(
-typedef struct {
-    uint32_t magic;
-    uintptr_t target_addr[TOTAL_FLASH_PAGES];
-    uint8_t status;
-    uint8_t reserved[3];
-}) flash_journal_t;
 static uint16_t journal_slot = 0;
 static uintptr_t last_journal_sector = 0x0;
 _Static_assert(sizeof(flash_journal_t) == 32, "flash_journal_t must be 32 bytes");
-#define JOURNAL_MAGIC 0x504A524Eu
-#define JOURNAL_STATUS_EMPTY    0xFF
-#define JOURNAL_STATUS_PENDING  0xFE
-#define JOURNAL_STATUS_DONE     0xFC
 _Static_assert(JOURNAL_STATUS_EMPTY == 0xFF, "");
 _Static_assert((JOURNAL_STATUS_PENDING & JOURNAL_STATUS_EMPTY) == JOURNAL_STATUS_PENDING, "");
 _Static_assert((JOURNAL_STATUS_DONE & JOURNAL_STATUS_PENDING) == JOURNAL_STATUS_DONE, "");
@@ -291,29 +281,9 @@ static bool journal_entry_is_erased(const flash_journal_t *entry) {
     return true;
 }
 
-static bool journal_entry_header_valid(const flash_journal_t *entry) {
-    if (entry->magic != JOURNAL_MAGIC) {
-        return false;
-    }
-    bool has_target = false;
-    for (int i = 0; i < TOTAL_FLASH_PAGES; i++) {
-        uintptr_t addr = entry->target_addr[i];
-        if (addr == 0 || addr == UINTPTR_MAX) {
-            continue;
-        }
-        has_target = true;
-        if (addr < start_data_pool || addr >= end_data_pool) {
-            return false;
-        }
-        if ((addr % FLASH_SECTOR_SIZE) != 0) {
-            return false;
-        }
-    }
-    return has_target;
-}
-
 static bool journal_entry_valid_at(const flash_journal_t *entry, uintptr_t journal_sector) {
-    if (!journal_entry_header_valid(entry)) {
+    if (!journal_entry_header_valid(entry, start_data_pool, end_data_pool,
+                                   start_rom_pool, end_rom_pool)) {
         return false;
     }
     if (entry->status != JOURNAL_STATUS_PENDING && entry->status != JOURNAL_STATUS_DONE) {
@@ -381,7 +351,8 @@ int low_flash_recover_journal(bool force) {
             if (target == UINTPTR_MAX || target == 0x00000000) {
                 continue;
             }
-            if (target < start_data_pool || target >= end_data_pool) {
+            if (!journal_target_valid(target, start_data_pool, end_data_pool,
+                                      start_rom_pool, end_rom_pool)) {
                 printf("WARN: FLASH JOURNAL TARGET ADDRESS OUT OF RANGE\n");
                 return PICOKEYS_ERR_MEMORY_FATAL;
             }
